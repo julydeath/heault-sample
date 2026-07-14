@@ -4,16 +4,20 @@ type GenerateJsonInput = {
   systemPrompt: string;
   userPrompt: string;
   schemaName: string;
+  images?: string[];
+  model?: string;
 };
 
 export class OllamaConfigurationError extends Error {}
 export class OllamaUnavailableError extends Error {}
 export class OllamaInvalidJsonError extends Error {}
 
-function getOllamaConfig() {
+const OLLAMA_CLOUD_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 45000);
+
+function getOllamaConfig(modelOverride?: string) {
   const apiKey = process.env.OLLAMA_API_KEY;
   const baseUrl = process.env.OLLAMA_BASE_URL || "https://ollama.com";
-  const model = process.env.OLLAMA_MODEL;
+  const model = modelOverride || process.env.OLLAMA_MODEL;
 
   if (!apiKey) {
     throw new OllamaConfigurationError("Ollama Cloud API key is not configured.");
@@ -47,8 +51,8 @@ function extractJsonFromResponse(value: unknown): unknown {
   }
 }
 
-async function callOllamaCloud(prompt: string) {
-  const { apiKey, baseUrl, model } = getOllamaConfig();
+async function callOllamaCloud(prompt: string, images?: string[], modelOverride?: string) {
+  const { apiKey, baseUrl, model } = getOllamaConfig(modelOverride);
 
   try {
     const { data } = await axios.post(
@@ -58,13 +62,15 @@ async function callOllamaCloud(prompt: string) {
         prompt,
         stream: false,
         format: "json",
+        ...(images?.length ? { images } : {}),
       },
       {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        timeout: 90000,
+        signal: AbortSignal.timeout(OLLAMA_CLOUD_TIMEOUT_MS),
+        timeout: OLLAMA_CLOUD_TIMEOUT_MS,
       }
     );
 
@@ -82,6 +88,8 @@ export async function generateJsonWithOllamaCloud({
   systemPrompt,
   userPrompt,
   schemaName,
+  images,
+  model,
 }: GenerateJsonInput) {
   const prompt = [
     systemPrompt,
@@ -102,7 +110,7 @@ export async function generateJsonWithOllamaCloud({
   ].join("\n");
 
   try {
-    return extractJsonFromResponse(await callOllamaCloud(prompt));
+    return extractJsonFromResponse(await callOllamaCloud(prompt, images, model));
   } catch (error) {
     if (!(error instanceof OllamaInvalidJsonError) && !(error instanceof SyntaxError)) {
       throw error;
@@ -110,7 +118,7 @@ export async function generateJsonWithOllamaCloud({
   }
 
   try {
-    return extractJsonFromResponse(await callOllamaCloud(strictRetryPrompt));
+    return extractJsonFromResponse(await callOllamaCloud(strictRetryPrompt, images, model));
   } catch (error) {
     if (error instanceof SyntaxError) {
       throw new OllamaInvalidJsonError("Ollama Cloud returned invalid JSON.");

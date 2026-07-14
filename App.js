@@ -9,6 +9,7 @@ import {
   Platform,
   SafeAreaView,
   ScrollView,
+  Share,
   StatusBar as NativeStatusBar,
   StyleSheet,
   Text,
@@ -51,6 +52,7 @@ import {
   Maximize2,
   MoreHorizontal,
   Phone,
+  Pill,
   Plus,
   RefreshCcw,
   RotateCw,
@@ -103,29 +105,134 @@ const C = {
   redSoft: "#FFE8EC",
 };
 
-const API_BASE_URL =
-  process.env.EXPO_PUBLIC_HEAULT_API_URL ||
-  (Platform.OS === "android" ? "http://10.0.2.2:4000" : "http://localhost:4000");
+const MAX_ANALYSIS_IMAGE_COUNT = 3;
+const MAX_ANALYSIS_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_ANALYSIS_IMAGE_CHARS = 12_000_000;
+
+function normalizeApiBaseUrl(value) {
+  const fallback = Platform.OS === "android" ? "http://127.0.0.1:4000" : "http://localhost:4000";
+  const raw = String(value || fallback).trim().replace(/\/+$/, "");
+  return raw.replace(/^https:\/\/(127\.0\.0\.1|localhost)(:\d+)?/i, "http://$1$2");
+}
+
+const API_BASE_URL = normalizeApiBaseUrl(process.env.EXPO_PUBLIC_HEAULT_API_URL);
 
 const VAULT_DIR = `${FileSystem.documentDirectory || ""}heault-originals/`;
+const STATE_FILE = `${FileSystem.documentDirectory || ""}heault-state.json`;
+
+function normalizeServerUser(user = {}) {
+  const phone = user.phoneE164 || user.phone || "";
+  return {
+    id: user.id || phone || "local-user",
+    name: user.name || (phone ? "Heault User" : ""),
+    phone,
+    dob: user.dob || "",
+    gender: user.gender || "",
+    blood: user.blood || "",
+    photo: user.photo || "",
+    lastDoctorVisit: {
+      doctor: "",
+      hospital: "",
+      date: "-",
+      reason: "",
+    },
+    vaccineRecord: {
+      total: 0,
+      latest: "",
+      next: "",
+    },
+  };
+}
+
+async function readSavedState() {
+  try {
+    const info = await FileSystem.getInfoAsync(STATE_FILE);
+    if (!info.exists) return null;
+    return JSON.parse(await FileSystem.readAsStringAsync(STATE_FILE));
+  } catch {
+    return null;
+  }
+}
+
+async function writeSavedState(state) {
+  if (!FileSystem.documentDirectory) return;
+  await FileSystem.writeAsStringAsync(STATE_FILE, JSON.stringify(state));
+}
+
+async function clearSavedState() {
+  await FileSystem.deleteAsync(STATE_FILE, { idempotent: true }).catch(() => undefined);
+}
+
+async function apiRequest(path, { method = "GET", token, body, headers = {} } = {}) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers: {
+      Accept: "application/json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...headers,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data.error || data.reason || "Request failed.");
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+async function requestOtpStart(countryCode, phone, mode = "login") {
+  return apiRequest("/api/auth/start", { method: "POST", body: { countryCode, phone, mode } });
+}
+
+async function requestOtpVerify({ countryCode, phone, phoneE164, code, mode = "login" }) {
+  return apiRequest("/api/auth/verify", { method: "POST", body: { countryCode, phone, phoneE164, code, mode } });
+}
+
+async function requestMe(token) {
+  return apiRequest("/api/me", { token });
+}
+
+async function requestProfileUpdate(token, profile) {
+  return apiRequest("/api/me", { method: "PATCH", token, body: profile });
+}
+
+async function requestDocuments(token) {
+  return apiRequest("/api/documents", { token });
+}
+
+async function requestDeleteDocument(token, documentId) {
+  return apiRequest(`/api/documents/${encodeURIComponent(documentId)}`, { method: "DELETE", token });
+}
+
+async function requestUpdateDocument(token, documentId, patch) {
+  return apiRequest(`/api/documents/${encodeURIComponent(documentId)}`, { method: "PATCH", token, body: patch });
+}
+
+async function requestLogout(token) {
+  if (!token) return;
+  await apiRequest("/api/auth/logout", { method: "POST", token }).catch(() => undefined);
+}
 
 const initialUser = {
-  name: "Alex Morgan",
-  phone: "+91 98480 XXXXX",
-  dob: "12 Oct 1994",
-  gender: "Female",
-  blood: "O+",
-  photo: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=240&q=80",
+  name: "",
+  phone: "",
+  dob: "",
+  gender: "",
+  blood: "",
+  photo: "",
   lastDoctorVisit: {
-    doctor: "Dr. Rhea Kapoor",
-    hospital: "MediCare Clinic",
-    date: "12 Oct",
-    reason: "Annual checkup",
+    doctor: "",
+    hospital: "",
+    date: "-",
+    reason: "",
   },
   vaccineRecord: {
-    total: 8,
-    latest: "Influenza",
-    next: "Oct 2026",
+    total: 0,
+    latest: "",
+    next: "",
   },
 };
 
@@ -232,7 +339,8 @@ function categoryFor(id) {
 function docMatches(doc, query) {
   const q = query.trim().toLowerCase();
   if (!q) return true;
-  return [doc.title, doc.category, doc.hospital, doc.doctor, doc.ocr, ...(doc.tags || [])]
+  const group = recordGroupForDoc(doc);
+  return [doc.title, doc.category, doc.hospital, doc.doctor, doc.patientName, group.label, group.helper, doc.ocr, ...(doc.tags || [])]
     .filter(Boolean)
     .some((value) => String(value).toLowerCase().includes(q));
 }
@@ -276,7 +384,8 @@ function statusCopy(status) {
     processing: ["Processing", C.blue, C.blueSoft],
     ocr_complete: ["OCR ready", C.blue, C.blueSoft],
     ready: ["Ready", C.green, C.greenSoft],
-    needs_review: ["Needs review", C.red, C.redSoft],
+    needs_review: ["Reupload", C.red, C.redSoft],
+    needs_reupload: ["Reupload", C.red, C.redSoft],
   };
   return map[status] || map.ready;
 }
@@ -289,14 +398,197 @@ function isProcessingStatus(status) {
   return ["queued", "processing", "ocr_complete"].includes(status);
 }
 
+function isReuploadStatus(status) {
+  return ["needs_review", "needs_reupload"].includes(status);
+}
+
+function normalizeGroupName(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/\b(?:a\s+)?unit\s+of\b.*$/g, "")
+    .replace(/\b(the|and|of|hospital|hospitals|clinic|clinics|medical|centre|center|healthcare|health|care|labs?|laborator(?:y|ies)|diagnostics?|pvt|private|ltd|limited|llp|inc)\b/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizedTokens(value = "") {
+  return normalizeGroupName(value).split(" ").filter(Boolean);
+}
+
+function shouldMergeGroupNames(a = "", b = "", sameBatch = false) {
+  const aTokens = normalizedTokens(a);
+  const bTokens = normalizedTokens(b);
+  if (!aTokens.length || !bTokens.length) return false;
+  const aNorm = aTokens.join(" ");
+  const bNorm = bTokens.join(" ");
+  if (aNorm === bNorm) return true;
+
+  const shorter = aNorm.length <= bNorm.length ? aNorm : bNorm;
+  const longer = aNorm.length > bNorm.length ? aNorm : bNorm;
+  if (shorter.length >= 5 && longer.includes(shorter)) return true;
+
+  const common = aTokens.filter((token) => bTokens.includes(token));
+  const overlap = common.length / Math.min(aTokens.length, bTokens.length);
+  if (Math.min(aTokens.length, bTokens.length) >= 2 && overlap >= 0.75) return true;
+  if (aTokens[0] === bTokens[0] && /\d/.test(aTokens[0]) && Math.min(aTokens.length, bTokens.length) === 1) return true;
+
+  return sameBatch && aTokens[0] === bTokens[0] && (common.length >= 2 || Math.min(aTokens.length, bTokens.length) === 1);
+}
+
+function findCompatibleGroup(map, group, doc) {
+  if (!["hospital", "doctor", "patient"].includes(group.type)) return null;
+  for (const existing of map.values()) {
+    if (existing.type !== group.type) continue;
+    const sameBatch = Boolean(doc.batchId && existing.docs.some((item) => item.batchId === doc.batchId));
+    if (shouldMergeGroupNames(existing.label, group.label, sameBatch)) return existing;
+  }
+  return null;
+}
+
+function periodFromDate(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "Unsorted documents";
+  const date = new Date(text);
+  if (!Number.isNaN(date.getTime())) {
+    return date.toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+  }
+  const match = text.match(/\b([A-Za-z]{3,9})\s+(\d{4})\b/);
+  return match ? `${match[1].slice(0, 3)} ${match[2]}` : text;
+}
+
+function groupLabelForMode(mode) {
+  const labels = {
+    hospital: "Hospital",
+    doctor: "Doctor",
+    patient: "Patient",
+    period: "Period",
+  };
+  return labels[mode] || "File";
+}
+
+function recordGroupForDoc(doc = {}, mode = "hospital") {
+  const hospital = String(doc.hospital || "").trim();
+  const doctor = String(doc.doctor || "").trim();
+  const patient = String(doc.patientName || doc.patient || "").trim();
+  const period = periodFromDate(doc.date);
+
+  if (mode === "doctor") {
+    if (doctor) {
+      return {
+        type: "doctor",
+        label: doctor,
+        key: `doctor:${normalizeGroupName(doctor) || doctor.toLowerCase()}`,
+        helper: hospital ? `${hospital} - ${period}` : period,
+      };
+    }
+    return {
+      type: "period",
+      label: period,
+      key: `doctor-missing:${normalizeGroupName(period) || "unsorted"}`,
+      helper: hospital ? `No doctor found - ${hospital}` : "No doctor found",
+    };
+  }
+
+  if (mode === "patient") {
+    if (patient) {
+      return {
+        type: "patient",
+        label: patient,
+        key: `patient:${normalizeGroupName(patient) || patient.toLowerCase()}`,
+        helper: [hospital || doctor, period].filter(Boolean).join(" - "),
+      };
+    }
+    return {
+      type: "period",
+      label: period,
+      key: `patient-missing:${normalizeGroupName(period) || "unsorted"}`,
+      helper: "No patient name found",
+    };
+  }
+
+  if (hospital) {
+    return {
+      type: "hospital",
+      label: hospital,
+      key: `hospital:${normalizeGroupName(hospital) || hospital.toLowerCase()}`,
+      helper: doctor ? `${doctor} - ${period}` : period,
+    };
+  }
+
+  if (doctor) {
+    return {
+      type: "doctor",
+      label: doctor,
+      key: `doctor:${normalizeGroupName(doctor) || doctor.toLowerCase()}`,
+      helper: period,
+    };
+  }
+
+  return {
+    type: "period",
+    label: period,
+    key: `period:${normalizeGroupName(period) || "unsorted"}`,
+    helper: "Hospital or doctor not found",
+  };
+}
+
+function groupingValueForMode(doc = {}, mode = "hospital") {
+  if (mode === "doctor") return String(doc.doctor || "").trim();
+  if (mode === "patient") return String(doc.patientName || doc.patient || "").trim();
+  return String(doc.hospital || "").trim();
+}
+
+function buildGroupingFallbacks(docs = [], mode = "hospital") {
+  const byBatch = new Map();
+  for (const doc of docs) {
+    if (!doc.batchId) continue;
+    const value = groupingValueForMode(doc, mode);
+    if (value && !byBatch.has(doc.batchId)) byBatch.set(doc.batchId, value);
+  }
+  return { byBatch };
+}
+
+function applyGroupingFallback(doc, docs, mode, fallbacks) {
+  if (groupingValueForMode(doc, mode)) return doc;
+  const fromBatch = doc.batchId ? fallbacks.byBatch.get(doc.batchId) : "";
+  let value = fromBatch;
+
+  if (!value && (isReuploadStatus(doc.status) || isProcessingStatus(doc.status))) {
+    const docTime = doc.sortDate || 0;
+    const nearby = docs
+      .filter((item) => item.id !== doc.id && groupingValueForMode(item, mode))
+      .map((item) => ({ item, distance: Math.abs((item.sortDate || 0) - docTime) }))
+      .filter((item) => item.distance <= 10 * 60 * 1000)
+      .sort((a, b) => a.distance - b.distance)[0]?.item;
+    value = groupingValueForMode(nearby, mode);
+  }
+
+  if (!value) return doc;
+  if (mode === "doctor") return { ...doc, doctor: value, helperFallback: "Grouped with same upload" };
+  if (mode === "patient") return { ...doc, patientName: value, helperFallback: "Grouped with same upload" };
+  return { ...doc, hospital: value, helperFallback: "Grouped with same upload" };
+}
+
+function withRecordGroup(doc) {
+  const group = recordGroupForDoc(doc);
+  return {
+    ...doc,
+    groupType: group.type,
+    groupLabel: group.label,
+    groupKey: group.key,
+  };
+}
+
 function openDocument(nav, doc) {
   if (!doc) return;
   if (isProcessingStatus(doc.status)) {
     nav.push("analysis", { method: doc.uploadSource || "gallery", docId: doc.id });
     return;
   }
-  if (doc.status === "needs_review") {
-    nav.push("ocrReview", { docId: doc.id });
+  if (isReuploadStatus(doc.status)) {
+    nav.push("analysis", { method: doc.uploadSource || "gallery", docId: doc.id });
     return;
   }
   nav.push("document", { docId: doc.id });
@@ -378,12 +670,12 @@ async function pickUploadAssets(method) {
   return result.assets;
 }
 
-function createDraftDocument(method, localFiles) {
+function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "") {
   const primary = localFiles[0];
   const now = new Date();
-  const id = `doc-${Date.now()}`;
+  const id = `doc-${now.getTime()}-${batchIndex}-${Math.random().toString(36).slice(2, 8)}`;
 
-  return {
+  return withRecordGroup({
     id,
     title: titleFromFileName(primary?.name || "Medical Document"),
     category: "others",
@@ -402,18 +694,22 @@ function createDraftDocument(method, localFiles) {
     mimeType: primary?.mimeType || "application/octet-stream",
     localUri: primary?.uri,
     localFiles,
+    batchId,
     originalSaved: true,
-  };
+  });
 }
 
-async function requestOcr(localFile) {
+async function requestOcr(localFile, documentId, token, batchId) {
   const upload = await FileSystem.uploadAsync(`${API_BASE_URL}/api/ocr`, localFile.uri, {
     fieldName: "file",
     httpMethod: "POST",
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     mimeType: localFile.mimeType || "application/octet-stream",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
     parameters: {
       fileName: localFile.name || "medical-document",
+      documentId: documentId || "",
+      batchId: batchId || "",
     },
   });
   const data = (() => {
@@ -425,26 +721,74 @@ async function requestOcr(localFile) {
   })();
 
   if (upload.status < 200 || upload.status >= 300) {
-    throw new Error(data.error || "OCR failed.");
+    const message = data.reason || data.error || "OCR failed.";
+    const error = new Error(message);
+    error.status = upload.status;
+    error.code = data.code;
+    error.needsReupload = data.status === "needs_reupload";
+    error.retryLater = data.status === "retry_later";
+    error.ocrConfidence = data.ocrConfidence;
+    error.originalStorage = data.originalStorage;
+    throw error;
   }
 
   return data;
 }
 
-async function requestDocumentAnalysis(doc, ocrText) {
+async function buildAnalysisImagePages(files = []) {
+  const imageFiles = files.filter((file) => file?.mimeType?.startsWith("image/")).slice(0, MAX_ANALYSIS_IMAGE_COUNT);
+  const imagePages = [];
+  let totalChars = 0;
+
+  for (let i = 0; i < imageFiles.length; i += 1) {
+    const file = imageFiles[i];
+    try {
+      const info = await FileSystem.getInfoAsync(file.uri, { size: true });
+      if (info?.size && info.size > MAX_ANALYSIS_IMAGE_BYTES) continue;
+      const base64 = await FileSystem.readAsStringAsync(file.uri, {
+        encoding: FileSystem.EncodingType?.Base64 || "base64",
+      });
+      if (!base64) continue;
+      totalChars += base64.length;
+      if (totalChars > MAX_ANALYSIS_IMAGE_CHARS) break;
+      imagePages.push({
+        page: i + 1,
+        mimeType: file.mimeType || "image/jpeg",
+        base64,
+      });
+    } catch {
+      // Keep analysis moving even if one local image cannot be encoded for optional vision extraction.
+    }
+  }
+
+  return imagePages;
+}
+
+async function requestDocumentAnalysis(doc, ocrText, pageTexts = [], files = [], token) {
+  const imagePages = await buildAnalysisImagePages(files);
   const response = await fetch(`${API_BASE_URL}/api/analyze-document`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({
       documentId: doc.id,
+      batchId: doc.batchId,
       fileName: doc.fileName || doc.title,
       mimeType: doc.mimeType || "application/octet-stream",
       ocrText,
+      ocrConfidence: doc.ocrConfidence,
+      pages: pageTexts.map((page) => ({
+        page: page.page,
+        confidence: page.confidence,
+      })),
+      imagePages,
     }),
   });
   const data = await response.json().catch(() => ({}));
 
-  if (!response.ok && data.status !== "needs_review") {
+  if (!response.ok && !isReuploadStatus(data.status)) {
     throw new Error(data.error || data.reason || "AI analysis failed.");
   }
 
@@ -452,36 +796,291 @@ async function requestDocumentAnalysis(doc, ocrText) {
 }
 
 function applyAnalysisToDoc(doc, analysis, ocrText) {
-  if (!analysis || analysis.status === "needs_review") {
-    return {
+  const structuredOcr = analysis?.structuredOcr || doc.structuredOcr || null;
+  const category = isKnownCategory(analysis?.category) ? analysis.category : doc.category || "others";
+  const tags = Array.isArray(analysis?.tags) ? analysis.tags.filter(Boolean).slice(0, 8) : doc.tags || [];
+  const warnings = Array.isArray(analysis?.warnings) ? analysis.warnings : doc.warnings || [];
+  const reuploadMessage = analysis?.reason || warnings[0] || "Reupload a clearer medical document.";
+
+  if (!analysis || isReuploadStatus(analysis.status)) {
+    return withRecordGroup({
       ...doc,
+      title: analysis?.title || doc.title,
+      category,
+      hospital: analysis?.hospital || doc.hospital,
+      doctor: analysis?.doctor || doc.doctor,
+      patientName: analysis?.patientName || doc.patientName,
+      date: analysis?.visitDate || doc.date,
+      tags,
       ocr: ocrText,
-      status: "needs_review",
-      needsReview: true,
-      aiError: analysis?.reason || "AI analysis needs manual review.",
-      summary: doc.summary || "Saved with OCR text. Review metadata manually.",
-    };
+      structuredOcr,
+      summary: analysis?.summary || analysis?.clinicalSummary || (analysis?.verifiedFacts?.length
+        ? "Some facts were extracted, but this page still needs a clearer replacement."
+        : "OCR finished, but the result was not reliable enough. Reupload this page."),
+      clinicalSummary: analysis?.clinicalSummary || "",
+      importantFindings: Array.isArray(analysis?.importantFindings) ? analysis.importantFindings : [],
+      medicines: Array.isArray(analysis?.medicines) ? analysis.medicines : [],
+      tests: Array.isArray(analysis?.tests) ? analysis.tests : [],
+      status: "needs_reupload",
+      needsReview: false,
+      aiError: reuploadMessage,
+      warnings,
+      ocrConfidence: typeof analysis?.ocrConfidence === "number" ? analysis.ocrConfidence : doc.ocrConfidence,
+      ocrProvider: doc.ocrProvider,
+      originalStorage: doc.originalStorage,
+      extractionMode: analysis?.extractionMode || doc.extractionMode || "ocr_text",
+      verifiedFacts: Array.isArray(analysis?.verifiedFacts) ? analysis.verifiedFacts : doc.verifiedFacts || [],
+      rejectedFacts: Array.isArray(analysis?.rejectedFacts) ? analysis.rejectedFacts : doc.rejectedFacts || [],
+      verification: analysis?.verification || doc.verification,
+    });
   }
 
-  const category = isKnownCategory(analysis.category) ? analysis.category : "others";
-  const tags = Array.isArray(analysis.tags) ? analysis.tags.filter(Boolean).slice(0, 8) : doc.tags || [];
-
-  return {
+  return withRecordGroup({
     ...doc,
     title: analysis.title || doc.title,
     category,
     hospital: analysis.hospital || doc.hospital,
     doctor: analysis.doctor || doc.doctor,
+    patientName: analysis.patientName || doc.patientName,
     date: analysis.visitDate || doc.date,
     tags,
     ocr: ocrText,
+    structuredOcr,
     summary: analysis.summary || doc.summary,
+    clinicalSummary: analysis.clinicalSummary || "",
+    importantFindings: Array.isArray(analysis.importantFindings) ? analysis.importantFindings : [],
+    medicines: Array.isArray(analysis.medicines) ? analysis.medicines : [],
+    tests: Array.isArray(analysis.tests) ? analysis.tests : [],
+    ocrConfidence: typeof analysis.ocrConfidence === "number" ? analysis.ocrConfidence : doc.ocrConfidence,
+    ocrProvider: doc.ocrProvider,
+    originalStorage: doc.originalStorage,
+    extractionMode: analysis.extractionMode || doc.extractionMode || "ocr_text",
+    verifiedFacts: Array.isArray(analysis.verifiedFacts) ? analysis.verifiedFacts : [],
+    rejectedFacts: Array.isArray(analysis.rejectedFacts) ? analysis.rejectedFacts : [],
+    verification: analysis.verification,
     confidence: analysis.confidence,
     warnings: Array.isArray(analysis.warnings) ? analysis.warnings : [],
-    status: analysis.needsReview ? "needs_review" : "ready",
-    needsReview: !!analysis.needsReview,
-    aiError: analysis.needsReview ? "AI marked this document for review." : "",
+    status: analysis.needsReview ? "needs_reupload" : "ready",
+    needsReview: false,
+    aiError: analysis.needsReview ? "Reupload a clearer medical document." : "",
+  });
+}
+
+function textFromOcrResponse(ocr) {
+  return cleanReadableText(ocr?.ocrText || ocr?.cleanedOcrText || ocr?.rawOcrText || "");
+}
+
+async function runDocumentPipeline(doc, app, callbacks = {}) {
+  const isActive = callbacks.isActive || (() => true);
+  const setStage = callbacks.setStage || (() => undefined);
+  const setProgress = callbacks.setProgress || (() => undefined);
+  const files = doc.localFiles?.length
+    ? doc.localFiles
+    : doc.localUri
+      ? [{ uri: doc.localUri, name: doc.fileName, mimeType: doc.mimeType }]
+      : [];
+
+  if (!files.length) {
+    throw new Error("Original file is missing from local storage.");
+  }
+
+  app.updateDocPatch(doc.id, { status: "processing", summary: "Original file saved. OCR and AI summary are running in the background." });
+
+  const pageTexts = [];
+  const fileTexts = [];
+
+  for (let i = 0; i < files.length; i += 1) {
+    if (!isActive()) return null;
+    setStage(`Running OCR on file ${i + 1} of ${files.length}`);
+    setProgress(Math.min(70, 22 + Math.round((i / files.length) * 42)));
+
+    const ocr = await requestOcr(files[i], doc.id, app.authToken, doc.batchId);
+    const responseText = textFromOcrResponse(ocr);
+    const returnedPages = ocr.pageLevelText?.length
+      ? ocr.pageLevelText
+      : [{ text: responseText, confidence: ocr.ocrConfidence }];
+
+    fileTexts.push({
+      sourceName: files[i].name,
+      text: responseText || cleanReadableText(returnedPages.map((page) => page.text || "").join("\n\n")),
+      provider: ocr.provider,
+      confidence: ocr.ocrConfidence,
+      originalStorage: ocr.originalStorage,
+    });
+
+    pageTexts.push(...returnedPages.map((page, pageIndex) => ({
+      ...page,
+      page: pageTexts.length + pageIndex + 1,
+      sourceName: files[i].name,
+      provider: ocr.provider,
+      confidence: typeof page.confidence === "number" ? page.confidence : ocr.ocrConfidence,
+    })));
+  }
+
+  const combinedText = cleanReadableText(fileTexts
+    .map((file, index) => {
+      const heading = files.length > 1 ? `## ${file.sourceName || `Document ${index + 1}`}` : "";
+      return [heading, file.text].filter(Boolean).join("\n\n");
+    })
+    .join("\n\n---\n\n"));
+  const confidenceValues = fileTexts.map((file) => file.confidence).filter((value) => typeof value === "number");
+  const ocrConfidence = confidenceValues.length
+    ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length
+    : undefined;
+  const ocrProvider = fileTexts.find((file) => file.provider)?.provider;
+  const originalStorage = fileTexts.find((file) => file.originalStorage)?.originalStorage || doc.originalStorage;
+
+  app.updateDocPatch(doc.id, {
+    ocr: combinedText,
+    pageLevelText: pageTexts,
+    ocrConfidence,
+    ocrProvider,
+    originalStorage,
+    status: "ocr_complete",
+    summary: "OCR complete. AI summary and grouping are running in the background.",
+  });
+
+  if (!isActive()) return null;
+  setStage("Writing summary and grouping record");
+  setProgress(82);
+
+  const analysisInput = { ...doc, ocr: combinedText, pageLevelText: pageTexts, ocrConfidence, ocrProvider, originalStorage };
+  const analysis = await requestDocumentAnalysis(analysisInput, combinedText, pageTexts, files, app.authToken);
+  const updated = applyAnalysisToDoc(analysisInput, analysis, combinedText);
+  app.updateDoc(updated);
+  setProgress(100);
+  setStage(updated.status === "ready" ? "Analysis complete" : "Reupload needed");
+  return updated;
+}
+
+function structuredTextForDoc(doc) {
+  return cleanReadableText(doc?.structuredOcr?.formattedText || doc?.ocr || "");
+}
+
+function cleanReadableText(value = "") {
+  const seen = new Set();
+  const lines = String(value || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/^\s*\[\d+\]\s*/, "").replace(/[ \t]+$/g, ""));
+  const output = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^page\s+\d+$/i.test(trimmed)) continue;
+
+    if (!trimmed) {
+      if (output.length && output[output.length - 1] !== "") output.push("");
+      continue;
+    }
+
+    const isStructureLine = /^#{1,6}\s|^\s*[-*]\s+|^\s*\d+\.\s+|^\s*\|.*\|\s*$|^\s*<\/?(table|thead|tbody|tr|td|th)/i.test(line);
+    const key = trimmed.toLowerCase().replace(/[^a-z0-9]+/gi, " ").trim();
+    if (!isStructureLine && key) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    output.push(line);
+  }
+
+  return output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function documentShareText(doc) {
+  const lines = [
+    doc?.title || "Medical document",
+    doc?.hospital ? `Hospital: ${doc.hospital}` : "",
+    doc?.doctor ? `Doctor: ${doc.doctor}` : "",
+    doc?.date ? `Visit date: ${doc.date}` : "",
+    doc?.summary ? `Summary: ${doc.summary}` : "",
+    structuredTextForDoc(doc) ? `\nExtracted text:\n${structuredTextForDoc(doc)}` : "",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+async function shareDocument(doc) {
+  try {
+    await Share.share({
+      title: doc?.title || "Heault document",
+      message: documentShareText(doc),
+    });
+  } catch (error) {
+    Alert.alert("Share failed", error?.message || "Could not share this document.");
+  }
+}
+
+function processingErrorMessage(error) {
+  if (error?.needsReupload) {
+    return error.message || "Please reupload a clearer medical document.";
+  }
+  if (error?.retryLater) {
+    return error.message || "OCR service is busy. Please retry in a minute.";
+  }
+  if (error?.message === "Network request failed") {
+    return "Network unavailable. Original file is saved. Try again or reupload when connected.";
+  }
+  return error?.message || "Processing failed. Original file is saved. Reupload this page if the image is unclear.";
+}
+
+function processingFailurePatch(error) {
+  const message = processingErrorMessage(error);
+  return {
+    status: "needs_reupload",
+    needsReview: false,
+    aiError: message,
+    ocrConfidence: typeof error?.ocrConfidence === "number" ? error.ocrConfidence : undefined,
+    originalStorage: error?.originalStorage,
+    summary: error?.needsReupload
+      ? "Original file saved. Please reupload a clearer medical document before OCR and AI can continue."
+      : error?.retryLater
+        ? "Original file saved. OCR service is temporarily unavailable; retry processing shortly."
+        : "Original file saved. Reupload this page if processing fails again.",
   };
+}
+
+function percentLabel(value) {
+  return typeof value === "number" ? `${Math.round(value * 100)}%` : "-";
+}
+
+function providerLabel(value) {
+  const labels = {
+    azure_document_intelligence: "Azure Document Intelligence",
+    tesseract: "Local OCR",
+    pdf_parse: "PDF text",
+  };
+  return labels[value] || value || "-";
+}
+
+function normalizeRemoteDocument(doc = {}, localDoc = {}) {
+  const date = doc.date ? new Date(doc.date) : null;
+  const sortDate = Number.isFinite(doc.sortDate)
+    ? doc.sortDate
+    : date && !Number.isNaN(date.getTime())
+      ? date.getTime()
+      : localDoc.sortDate || Date.now();
+  return withRecordGroup({
+    ...localDoc,
+    ...doc,
+    id: doc.id || doc.documentId || localDoc.id,
+    documentId: doc.documentId || doc.id || localDoc.documentId || localDoc.id,
+    title: doc.title || localDoc.title || "Medical document",
+    category: isKnownCategory(doc.category) ? doc.category : localDoc.category || "others",
+    date: typeof doc.date === "string" && doc.date.includes("T") ? formatDate(new Date(doc.date)) : doc.date || localDoc.date || formatDate(new Date()),
+    sortDate,
+    tags: Array.isArray(doc.tags) ? doc.tags : localDoc.tags || [],
+    pages: doc.pages || localDoc.pages || 1,
+    localFiles: localDoc.localFiles,
+    localUri: localDoc.localUri,
+    originalSaved: true,
+  });
+}
+
+function mergeRemoteDocuments(localDocs = [], remoteDocs = []) {
+  const byId = new Map(localDocs.map((doc) => [doc.documentId || doc.id, doc]));
+  const merged = remoteDocs.map((remote) => normalizeRemoteDocument(remote, byId.get(remote.documentId || remote.id) || {}));
+  const remoteIds = new Set(merged.map((doc) => doc.documentId || doc.id));
+  const localOnly = localDocs.filter((doc) => !remoteIds.has(doc.documentId || doc.id));
+  return [...merged, ...localOnly].sort((a, b) => (b.sortDate || 0) - (a.sortDate || 0));
 }
 
 function Screen({ children, scroll = true, bottomPad = 24 }) {
@@ -784,26 +1383,49 @@ function Welcome({ nav }) {
         <LinearGradient colors={[C.primary, C.primary2, C.primary3]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.welcomeCard}>
           <ShieldCheck size={24} color="#fff" />
           <Text style={styles.welcomeTitle}>Your medical vault is ready.</Text>
-          <Text style={styles.welcomeBody}>Sign in with mobile OTP or continue with the saved sample session.</Text>
+          <Text style={styles.welcomeBody}>Create a secure vault or login with your existing mobile number.</Text>
         </LinearGradient>
         <View style={styles.flexFill} />
-        <AppButton icon={Phone} onPress={() => nav.push("phone")} style={styles.fullWidth}>Mobile OTP login</AppButton>
-        <AppButton tone="soft" icon={UserRound} onPress={() => nav.go("home")} style={[styles.fullWidth, { marginTop: 12 }]}>Continue as Alex</AppButton>
+        <AppButton icon={UserRound} onPress={() => nav.push("phone", { mode: "signup" })} style={styles.fullWidth}>Create account</AppButton>
+        <AppButton tone="soft" icon={Phone} onPress={() => nav.push("phone", { mode: "login" })} style={[styles.fullWidth, { marginTop: 12 }]}>Login</AppButton>
       </View>
     </Screen>
   );
 }
 
-function PhoneEntry({ nav }) {
+function PhoneEntry({ nav, params }) {
   const [num, setNum] = useState("");
+  const [countryCode, setCountryCode] = useState("+91");
+  const [loading, setLoading] = useState(false);
+  const mode = params?.mode === "signup" ? "signup" : "login";
+  const isSignup = mode === "signup";
+  const continueWithOtp = async () => {
+    try {
+      setLoading(true);
+      const data = await requestOtpStart(countryCode, num, mode);
+      nav.push("otp", { countryCode, phone: num, phoneE164: data.phoneE164, bypass: data.bypass, mode });
+    } catch (error) {
+      Alert.alert("OTP failed", error?.message || "Could not send OTP.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <Screen scroll={false}>
       <Header nav={nav} app={{}} title="" back right={<View style={styles.smallIconButton} />} />
       <View style={styles.authBody}>
-        <Text style={styles.authTitle}>Enter mobile number</Text>
-        <Text style={styles.authSubtitle}>We will send a one-time password to verify your account.</Text>
+        <Text style={styles.authTitle}>{isSignup ? "Create account" : "Login"}</Text>
+        <Text style={styles.authSubtitle}>{isSignup ? "Enter a new mobile number. If this number already has an account, use Login instead." : "Enter your registered mobile number. New users should create an account first."}</Text>
         <View style={styles.phoneRow}>
-          <View style={styles.countryBox}><Text style={styles.countryText}>IN +91</Text></View>
+          <View style={styles.countryBox}>
+            <TextInput
+              value={countryCode}
+              onChangeText={(value) => setCountryCode(`+${value.replace(/\D/g, "").slice(0, 4)}`)}
+              keyboardType="phone-pad"
+              style={styles.countryInput}
+            />
+          </View>
           <TextInput
             value={num}
             onChangeText={(value) => setNum(value.replace(/\D/g, "").slice(0, 10))}
@@ -815,15 +1437,17 @@ function PhoneEntry({ nav }) {
         </View>
       </View>
       <View style={styles.flexFill} />
-      <View style={styles.bottomAction}><AppButton disabled={num.length < 10} onPress={() => nav.push("otp")} style={styles.fullWidth}>Continue</AppButton></View>
+      <View style={styles.bottomAction}><AppButton disabled={num.length < 7 || loading} onPress={continueWithOtp} style={styles.fullWidth}>{loading ? "Sending..." : "Send OTP"}</AppButton></View>
     </Screen>
   );
 }
 
-function OTP({ nav }) {
+function OTP({ nav, app, params }) {
   const [code, setCode] = useState(["", "", "", ""]);
   const [timer, setTimer] = useState(28);
+  const [loading, setLoading] = useState(false);
   const refs = [useRef(null), useRef(null), useRef(null), useRef(null)];
+  const mode = params?.mode === "signup" ? "signup" : "login";
 
   useEffect(() => {
     const t = setInterval(() => setTimer((s) => Math.max(0, s - 1)), 1000);
@@ -831,12 +1455,43 @@ function OTP({ nav }) {
   }, []);
 
   const done = code.every(Boolean);
+  const submit = async () => {
+    try {
+      setLoading(true);
+      const data = await requestOtpVerify({
+        countryCode: params?.countryCode || "+91",
+        phone: params?.phone || "",
+        phoneE164: params?.phoneE164,
+        code: code.join(""),
+        mode,
+      });
+      await app?.finishAuth?.({ token: data.token, user: data.user });
+      if (mode === "signup") {
+        nav.push("onboarding");
+      } else {
+        nav.go("home");
+      }
+    } catch (error) {
+      Alert.alert("Invalid OTP", error?.message || "Could not verify OTP.");
+    } finally {
+      setLoading(false);
+    }
+  };
+  const resend = async () => {
+    try {
+      await requestOtpStart(params?.countryCode || "+91", params?.phone || "", mode);
+      setTimer(28);
+    } catch (error) {
+      Alert.alert("OTP failed", error?.message || "Could not resend OTP.");
+    }
+  };
+
   return (
     <Screen scroll={false}>
       <Header nav={nav} app={{}} title="" back right={<View style={styles.smallIconButton} />} />
       <View style={styles.authBody}>
         <Text style={styles.authTitle}>Verify OTP</Text>
-        <Text style={styles.authSubtitle}>Sent to +91 98480 12345</Text>
+        <Text style={styles.authSubtitle}>Sent to {params?.phoneE164 || "your mobile number"}{params?.bypass ? ". Dev OTP is 1234." : ""}</Text>
         <View style={styles.otpRow}>
           {code.map((digit, i) => (
             <TextInput
@@ -856,12 +1511,12 @@ function OTP({ nav }) {
             />
           ))}
         </View>
-        <TouchableOpacity disabled={timer > 0} onPress={() => setTimer(28)} style={{ alignSelf: "flex-start", marginTop: 18 }}>
+        <TouchableOpacity disabled={timer > 0} onPress={resend} style={{ alignSelf: "flex-start", marginTop: 18 }}>
           <Text style={[styles.textButton, timer > 0 && { color: C.muted }]}>{timer > 0 ? `Resend in 0:${String(timer).padStart(2, "0")}` : "Resend code"}</Text>
         </TouchableOpacity>
       </View>
       <View style={styles.flexFill} />
-      <View style={styles.bottomAction}><AppButton disabled={!done} onPress={() => nav.push("onboarding")} style={styles.fullWidth}>Verify</AppButton></View>
+      <View style={styles.bottomAction}><AppButton disabled={!done || loading} onPress={submit} style={styles.fullWidth}>{loading ? "Verifying..." : "Verify"}</AppButton></View>
     </Screen>
   );
 }
@@ -870,8 +1525,8 @@ function Onboarding({ nav, app }) {
   const [form, setForm] = useState({ name: "", dob: "", gender: "", blood: "", photo: "" });
   const canSave = form.name.trim().length > 1 && form.dob.trim().length > 3 && form.gender;
   const bloodGroups = ["A+", "A-", "B+", "B-", "O+", "O-", "AB+", "AB-"];
-  const save = () => {
-    app.setUser({
+  const save = async () => {
+    await app.saveUserProfile?.({
       ...app.user,
       name: form.name || app.user.name,
       dob: form.dob || app.user.dob,
@@ -928,30 +1583,44 @@ function SegmentButton({ label, active, onPress, icon: Icon }) {
 
 function HomeScreen({ nav, app }) {
   const readyCount = app.docs.filter((doc) => doc.status === "ready" || !doc.status).length;
-  const reviewCount = app.docs.filter((doc) => doc.status === "needs_review").length;
-  const processingCount = app.docs.filter((doc) => isProcessingStatus(doc.status)).length;
+  const reuploadCount = app.docs.filter((doc) => isReuploadStatus(doc.status)).length;
+  const firstName = app.user.name?.trim()?.split(" ")[0] || "there";
   return (
     <Screen bottomPad={122}>
       <Header nav={nav} app={app} />
       <View style={styles.pageBody}>
-        <Text style={styles.homeTitle}>Good morning, {app.user.name.split(" ")[0]}</Text>
-        <Text style={styles.homeSubtitle}>Your medical document vault is ready.</Text>
-        <SearchBox onFocus={() => nav.push("search")} />
-
-        <View style={styles.homeStats}>
-          <SimpleStat icon={Files} label="Documents" value={app.docs.length} />
-          <SimpleStat icon={ShieldCheck} label="Ready" value={readyCount} />
-          <SimpleStat icon={Edit3} label="Review" value={reviewCount + processingCount} />
-        </View>
-
-        <TouchableOpacity activeOpacity={0.84} onPress={() => app.startUpload?.("gallery")} style={styles.primaryUploadCard}>
-          <View style={styles.primaryUploadIcon}><Plus size={22} color="#fff" /></View>
-          <View style={styles.flexFill}>
-            <Text style={styles.primaryUploadTitle}>Upload a document</Text>
-            <Text style={styles.primaryUploadText}>Save original, extract OCR, summarize, and categorize.</Text>
+        <LinearGradient colors={["#FFF7FA", "#FFE1EC", "#FA8DB1"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.homeHeroCard}>
+          <View style={styles.homeHeroTop}>
+            <View style={styles.homeHeroMark}>
+              <MedicalCross size={34} color={C.primary} />
+            </View>
+            <View style={styles.flexFill}>
+              <Text style={styles.homeHeroEyebrow}>Heault vault</Text>
+              <Text style={styles.homeHeroTitle}>Good morning, {firstName}</Text>
+            </View>
           </View>
-          <ChevronRight size={20} color={C.primary} />
-        </TouchableOpacity>
+          <Text style={styles.homeHeroText}>Capture medical papers, organize them by hospital, and retrieve them when you visit again.</Text>
+          <View style={styles.homeHeroStats}>
+            <View>
+              <Text style={styles.homeHeroNumber}>{app.docs.length}</Text>
+              <Text style={styles.homeHeroLabel}>Documents</Text>
+            </View>
+            <View style={styles.homeHeroDivider} />
+            <View>
+              <Text style={styles.homeHeroNumber}>{readyCount}</Text>
+              <Text style={styles.homeHeroLabel}>Ready</Text>
+            </View>
+            <View style={styles.homeHeroDivider} />
+            <View>
+              <Text style={styles.homeHeroNumber}>{reuploadCount}</Text>
+              <Text style={styles.homeHeroLabel}>Reupload</Text>
+            </View>
+          </View>
+          <TouchableOpacity activeOpacity={0.84} onPress={() => app.startUpload?.("gallery")} style={styles.homeHeroAction}>
+            <Plus size={18} color="#fff" />
+            <Text style={styles.homeHeroActionText}>Add medical document</Text>
+          </TouchableOpacity>
+        </LinearGradient>
 
         <View style={styles.infoGrid}>
           <Card style={styles.infoCard}>
@@ -1000,21 +1669,15 @@ function SimpleStat({ icon: Icon, label, value }) {
 }
 
 function RecordsScreen({ nav, app, params }) {
-  const [query, setQuery] = useState("");
-  const [category, setCategory] = useState(params?.category || "all");
-  const [sort, setSort] = useState("latest");
+  const [viewMode, setViewMode] = useState("hospital");
 
   const results = useMemo(() => {
-    const filtered = app.docs.filter((doc) => (category === "all" || doc.category === category) && docMatches(doc, query));
-    return [...filtered].sort((a, b) => {
-      if (sort === "oldest") return a.sortDate - b.sortDate;
-      if (sort === "alpha") return a.title.localeCompare(b.title);
-      return b.sortDate - a.sortDate;
-    });
-  }, [app.docs, category, query, sort]);
+    return [...app.docs].sort((a, b) => (b.sortDate || 0) - (a.sortDate || 0));
+  }, [app.docs]);
+  const groups = useMemo(() => groupRecords(results, "latest", viewMode), [results, viewMode]);
 
   const readyCount = app.docs.filter((doc) => doc.status === "ready" || !doc.status).length;
-  const reviewCount = app.docs.filter((doc) => doc.status === "needs_review").length;
+  const reuploadCount = app.docs.filter((doc) => isReuploadStatus(doc.status)).length;
 
   return (
     <Screen bottomPad={122}>
@@ -1022,40 +1685,276 @@ function RecordsScreen({ nav, app, params }) {
       <View style={styles.pageBody}>
         <View style={styles.simplePageHeader}>
           <Text style={styles.simplePageTitle}>Medical records</Text>
-          <Text style={styles.simplePageSubtitle}>Search, review, and open saved documents.</Text>
+          <Text style={styles.simplePageSubtitle}>Open your saved files by hospital, doctor, or patient.</Text>
         </View>
 
-        <Card style={styles.recordsCommandCenter}>
-          <SearchBox value={query} onChangeText={setQuery} placeholder="Search names, OCR text, hospital, doctor, tags..." />
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.recordsCategoryStrip}>
-            <Chip label="All" active={category === "all"} onPress={() => setCategory("all")} />
-            {CATEGORIES.map((cat) => (
-              <Chip key={cat.id} label={cat.label} active={category === cat.id} onPress={() => setCategory(cat.id)} />
-            ))}
-          </ScrollView>
-          <View style={styles.recordsSortStrip}>
-            <SegmentButton active={sort === "latest"} label="Latest" icon={Clock} onPress={() => setSort("latest")} />
-            <SegmentButton active={sort === "oldest"} label="Oldest" icon={Clock} onPress={() => setSort("oldest")} />
-            <SegmentButton active={sort === "alpha"} label="A-Z" icon={SortAsc} onPress={() => setSort("alpha")} />
-          </View>
-        </Card>
+        <View style={styles.recordsModeTabs}>
+          <DrawerModeButton label="Hospital" icon={Building2} active={viewMode === "hospital"} onPress={() => setViewMode("hospital")} />
+          <DrawerModeButton label="Doctor" icon={Stethoscope} active={viewMode === "doctor"} onPress={() => setViewMode("doctor")} />
+          <DrawerModeButton label="Patient" icon={UserRound} active={viewMode === "patient"} onPress={() => setViewMode("patient")} />
+        </View>
 
         <View style={styles.recordsStatsGrid}>
           <RecordsStat icon={Files} label="Total files" value={app.docs.length} tone="blue" />
           <RecordsStat icon={ShieldCheck} label="Ready" value={readyCount} tone="green" />
-          <RecordsStat icon={Edit3} label="Review" value={reviewCount} tone="amber" />
+          <RecordsStat icon={RefreshCcw} label="Reupload" value={reuploadCount} tone="amber" />
         </View>
 
-        <SectionTitle text={`${results.length} records`} action="Upload" onAction={() => app.startUpload?.("gallery")} />
+        <SectionTitle text={`${groups.length} ${viewMode} file${groups.length === 1 ? "" : "s"}`} action="Upload" onAction={() => app.startUpload?.("gallery")} />
         {results.length === 0 ? (
-          <EmptyState icon={Files} title={query ? "No search results found" : "No records in this category"} subtitle="Try another category, doctor, hospital, or tag." />
+          <EmptyState icon={Files} title={`No ${viewMode} records yet`} subtitle="Upload medical documents to build your records drawer." />
         ) : (
           <View style={styles.recordsList}>
-            {results.map((doc) => (
-              <EnterpriseRecordCard key={doc.id} doc={doc} onPress={() => openDocument(nav, doc)} />
+            {groups.map((group) => (
+              <RecordGroupCard key={group.key} group={group} nav={nav} mode={viewMode} />
             ))}
           </View>
         )}
+      </View>
+    </Screen>
+  );
+}
+
+function DrawerModeButton({ label, icon: Icon, active, onPress }) {
+  return (
+    <TouchableOpacity activeOpacity={0.78} onPress={onPress} style={[styles.drawerModeButton, active && styles.drawerModeButtonActive]}>
+      <Icon size={15} color={active ? C.primary : C.muted} />
+      <Text style={[styles.drawerModeText, active && { color: C.primary }]}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function groupRecords(docs, sort = "latest", mode = "hospital") {
+  const map = new Map();
+  const fallbacks = buildGroupingFallbacks(docs, mode);
+
+  for (const sourceDoc of docs) {
+    const doc = applyGroupingFallback(sourceDoc, docs, mode, fallbacks);
+    const rawGroup = recordGroupForDoc(doc, mode);
+    const compatible = findCompatibleGroup(map, rawGroup, doc);
+    const group = compatible || rawGroup;
+    const existing = map.get(group.key) || {
+      ...group,
+      docs: [],
+      latestSortDate: 0,
+      oldestSortDate: Number.MAX_SAFE_INTEGER,
+      categories: new Set(),
+      pageCount: 0,
+    };
+    existing.docs.push(doc);
+    existing.latestSortDate = Math.max(existing.latestSortDate, doc.sortDate || 0);
+    existing.oldestSortDate = Math.min(existing.oldestSortDate, doc.sortDate || 0);
+    existing.categories.add(categoryFor(doc.category).label);
+    existing.pageCount += Number(doc.pages || 1);
+    map.set(group.key, existing);
+  }
+
+  const groups = [...map.values()].map((group) => ({
+    ...group,
+    docs: group.docs.sort((a, b) => (b.sortDate || 0) - (a.sortDate || 0)),
+    categoryLabels: [...group.categories].slice(0, 3),
+  }));
+
+  return groups.sort((a, b) => {
+    if (sort === "alpha") return a.label.localeCompare(b.label);
+    if (sort === "oldest") return (a.latestSortDate || 0) - (b.latestSortDate || 0);
+    return (b.latestSortDate || 0) - (a.latestSortDate || 0);
+  });
+}
+
+function RecordGroupCard({ group, nav, mode }) {
+  const typeIcon = {
+    hospital: Building2,
+    doctor: Stethoscope,
+    patient: UserRound,
+    period: CalendarClock,
+  };
+  const Icon = typeIcon[group.type] || FolderOpen;
+  const processing = group.docs.filter((doc) => isProcessingStatus(doc.status)).length;
+  const reuploadCount = group.docs.filter((doc) => isReuploadStatus(doc.status)).length;
+  const latestDoc = group.docs[0];
+  const openGroup = () => nav.push("recordGroup", { groupKey: group.key, mode });
+
+  return (
+    <View style={styles.recordGroupCard}>
+      <View style={styles.folderTab}>
+        <Icon size={14} color={C.primary} />
+        <Text style={styles.folderTabText}>{groupLabelForMode(group.type)}</Text>
+      </View>
+      <TouchableOpacity activeOpacity={0.82} onPress={openGroup} style={styles.recordGroupHeader}>
+        <View style={styles.recordGroupIcon}>
+          <Icon size={21} color={C.primary} />
+        </View>
+        <View style={styles.flexFill}>
+          <Text style={styles.recordGroupTitle} numberOfLines={1}>{group.label}</Text>
+          <Text style={styles.recordGroupSub} numberOfLines={1}>
+            {group.helper || `Latest ${latestDoc?.date || "-"}`}
+          </Text>
+        </View>
+        {!!processing && <StatusPill status="processing" />}
+        {!processing && <ChevronRight size={18} color={C.primary} />}
+      </TouchableOpacity>
+      <View style={styles.recordGroupMetaRow}>
+        <View style={styles.recordGroupMetric}>
+          <Files size={14} color={C.primary} />
+          <Text style={styles.recordGroupMeta}>{group.docs.length} document{group.docs.length === 1 ? "" : "s"}</Text>
+        </View>
+        <View style={styles.recordGroupMetric}>
+          <FileText size={14} color={C.primary} />
+          <Text style={styles.recordGroupMeta}>{group.pageCount} page{group.pageCount === 1 ? "" : "s"}</Text>
+        </View>
+        {!!reuploadCount && (
+          <View style={[styles.recordGroupMetric, styles.recordGroupReviewMetric]}>
+            <RefreshCcw size={14} color={C.amber} />
+            <Text style={[styles.recordGroupMeta, { color: C.amber }]}>{reuploadCount} reupload</Text>
+          </View>
+        )}
+      </View>
+      <View style={styles.drawerFileStack}>
+        {group.docs.slice(0, 3).map((doc, index) => (
+          <TouchableOpacity key={doc.id} activeOpacity={0.78} onPress={() => openDocument(nav, doc)} style={[styles.drawerFileRow, index > 0 && styles.drawerFileRowOverlap]}>
+            <View style={[styles.drawerFileStripe, { backgroundColor: categoryFor(doc.category).color }]} />
+            <View style={styles.flexFill}>
+              <Text style={styles.drawerFileTitle} numberOfLines={1}>{doc.title}</Text>
+              <Text style={styles.drawerFileMeta} numberOfLines={1}>{categoryFor(doc.category).label} - {doc.date || "Date not found"}</Text>
+            </View>
+            <StatusPill status={doc.status || "ready"} />
+          </TouchableOpacity>
+        ))}
+        {group.docs.length > 3 && (
+          <TouchableOpacity activeOpacity={0.78} onPress={openGroup} style={styles.drawerMoreRow}>
+            <Files size={15} color={C.primary} />
+            <Text style={styles.drawerMoreText}>{group.docs.length - 3} more document{group.docs.length - 3 === 1 ? "" : "s"}</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+      <TouchableOpacity activeOpacity={0.78} onPress={openGroup} style={styles.recordGroupOpenRow}>
+        <Text style={styles.recordGroupOpenText}>Open {groupLabelForMode(group.type).toLowerCase()} file</Text>
+        <ChevronRight size={16} color={C.primary} />
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+function originalPagesForDocs(docs = []) {
+  return docs.flatMap((doc) => {
+    const files = doc.localFiles?.length
+      ? doc.localFiles
+      : doc.localUri
+        ? [{ uri: doc.localUri, name: doc.fileName, mimeType: doc.mimeType }]
+        : [];
+    return files.map((file, index) => ({ doc, file, index }));
+  });
+}
+
+function RecordGroupDetail({ nav, app, params }) {
+  const mode = params?.mode || "hospital";
+  const group = useMemo(() => groupRecords(app.docs, "latest", mode).find((item) => item.key === params?.groupKey), [app.docs, mode, params?.groupKey]);
+  const originals = useMemo(() => originalPagesForDocs(group?.docs || []), [group]);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const selected = originals[Math.min(selectedIndex, Math.max(0, originals.length - 1))];
+  const selectedDoc = selected?.doc;
+  const selectedIsImage = selected?.file?.mimeType?.startsWith("image/");
+  const selectedNeedsReupload = isReuploadStatus(selectedDoc?.status);
+
+  useEffect(() => {
+    if (selectedIndex >= originals.length) setSelectedIndex(Math.max(0, originals.length - 1));
+  }, [originals.length, selectedIndex]);
+
+  if (!group) {
+    return (
+      <Screen bottomPad={34}>
+        <Header nav={nav} app={app} title="Record file" back />
+        <EmptyState icon={FolderOpen} title="File not found" subtitle="This record group may have moved after metadata changed." />
+      </Screen>
+    );
+  }
+
+  return (
+    <Screen bottomPad={34}>
+      <Header nav={nav} app={app} title="Record file" back />
+      <View style={styles.pageBody}>
+        <View style={styles.groupDetailHeader}>
+          <View style={styles.recordGroupIcon}>
+            {(group.type === "doctor" ? <Stethoscope size={22} color={C.primary} /> : group.type === "patient" ? <UserRound size={22} color={C.primary} /> : <Building2 size={22} color={C.primary} />)}
+          </View>
+          <View style={styles.flexFill}>
+            <Text style={styles.simplePageTitle} numberOfLines={2}>{group.label}</Text>
+            <Text style={styles.simplePageSubtitle}>{group.docs.length} documents - {group.pageCount} pages</Text>
+          </View>
+        </View>
+
+        {!!originals.length && (
+          <Card style={styles.groupOriginalViewer}>
+            <View style={styles.groupViewerTop}>
+              <Text style={styles.groupViewerTitle}>Uploaded files</Text>
+              <Text style={styles.groupViewerCount}>{Math.min(selectedIndex + 1, originals.length)} / {originals.length}</Text>
+            </View>
+            <View style={styles.groupPreviewStage}>
+              <Animated.View style={{ transform: [{ scale: zoom }, { rotate: `${rotation}deg` }] }}>
+                {selectedIsImage ? (
+                  <Image source={{ uri: selected.file.uri }} style={styles.groupPreviewImage} resizeMode="contain" />
+                ) : (
+                  <View style={styles.groupPdfPreview}>
+                    <FileText size={36} color={C.primary} />
+                    <Text style={styles.groupPdfTitle} numberOfLines={2}>{selected?.file?.name || selected?.doc?.fileName || "PDF document"}</Text>
+                  </View>
+                )}
+              </Animated.View>
+            </View>
+            {!!selectedDoc && (
+              <View style={styles.groupSelectedMeta}>
+                <View style={styles.flexFill}>
+                  <Text style={styles.groupSelectedTitle} numberOfLines={1}>{selectedDoc.title || selectedDoc.fileName || "Uploaded file"}</Text>
+                  <Text style={styles.groupSelectedSub} numberOfLines={1}>{selected?.file?.name || selectedDoc.fileName || "Original saved locally"}</Text>
+                </View>
+                <StatusPill status={selectedDoc.status || "ready"} />
+              </View>
+            )}
+            <View style={styles.viewerTools}>
+              <ViewerTool icon={ChevronLeft} onPress={() => setSelectedIndex((index) => Math.max(0, index - 1))} />
+              <ViewerTool icon={ChevronRight} onPress={() => setSelectedIndex((index) => Math.min(originals.length - 1, index + 1))} />
+              <ViewerTool icon={ZoomOut} onPress={() => setZoom((z) => Math.max(0.8, z - 0.1))} />
+              <ViewerTool icon={ZoomIn} onPress={() => setZoom((z) => Math.min(1.45, z + 0.1))} />
+              <ViewerTool icon={RotateCw} onPress={() => setRotation((r) => r + 90)} />
+            </View>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.groupThumbRow}>
+              {originals.map((item, index) => {
+                const isImage = item.file?.mimeType?.startsWith("image/");
+                return (
+                  <TouchableOpacity key={`${item.doc.id}-${index}`} activeOpacity={0.78} onPress={() => setSelectedIndex(index)} style={[styles.groupThumb, selectedIndex === index && styles.groupThumbActive]}>
+                    {isImage ? <Image source={{ uri: item.file.uri }} style={styles.groupThumbImage} resizeMode="cover" /> : <FileText size={24} color={C.primary} />}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+            {selectedNeedsReupload && (
+              <AppButton icon={RefreshCcw} onPress={() => app.reuploadDoc?.(selectedDoc.id)} style={[styles.fullWidth, { marginTop: 14 }]}>
+                Reupload this file
+              </AppButton>
+            )}
+          </Card>
+        )}
+
+        <Card style={styles.infoPanel}>
+          <View style={styles.insightPanelHeader}>
+            <FolderOpen size={17} color={C.primary} />
+            <Text style={styles.ocrTitle}>File details</Text>
+          </View>
+          <InfoRow label="Grouped by" value={groupLabelForMode(group.type)} />
+          <InfoRow label="Latest upload" value={group.docs[0]?.date} />
+          <InfoRow label="Categories" value={group.categoryLabels.join(", ")} />
+          <InfoRow label="Status" value={group.docs.some((doc) => isReuploadStatus(doc.status)) ? "Reupload needed" : group.docs.some((doc) => isProcessingStatus(doc.status)) ? "Processing" : "Ready"} />
+        </Card>
+
+        <SectionTitle text="Documents" />
+        <View style={styles.groupDocsList}>
+          {group.docs.map((doc) => (
+            <EnterpriseRecordCard key={doc.id} doc={doc} onPress={() => openDocument(nav, doc)} />
+          ))}
+        </View>
       </View>
     </Screen>
   );
@@ -1089,12 +1988,12 @@ function StatusPill({ status }) {
   );
 }
 
-function EnterpriseRecordCard({ doc, onPress }) {
+function EnterpriseRecordCard({ doc, onPress, compact = false }) {
   const cat = categoryFor(doc.category);
   const Icon = cat.icon;
   const summary = doc.summary || doc.ocr || "Original file saved in the vault.";
   return (
-    <TouchableOpacity activeOpacity={0.82} onPress={onPress} style={styles.enterpriseRecordCard}>
+    <TouchableOpacity activeOpacity={0.82} onPress={onPress} style={[styles.enterpriseRecordCard, compact && styles.enterpriseRecordCardCompact]}>
       <View style={styles.recordCardTop}>
         <View style={[styles.recordCategoryIcon, { backgroundColor: cat.tint }]}>
           <Icon size={20} color={cat.color} />
@@ -1105,7 +2004,7 @@ function EnterpriseRecordCard({ doc, onPress }) {
         </View>
         <StatusPill status={doc.status || "ready"} />
       </View>
-      <Text style={styles.recordCardSummary} numberOfLines={2}>{summary}</Text>
+      {!compact && <Text style={styles.recordCardSummary} numberOfLines={2}>{summary}</Text>}
       <View style={styles.recordMetaGrid}>
         <View style={styles.recordMetaItem}>
           <Building2 size={14} color={C.muted} />
@@ -1116,7 +2015,7 @@ function EnterpriseRecordCard({ doc, onPress }) {
           <Text style={styles.recordMetaText} numberOfLines={1}>{doc.doctor || "Doctor not set"}</Text>
         </View>
       </View>
-      <View style={styles.recordCardFooter}>
+      {!compact && <View style={styles.recordCardFooter}>
         <View style={styles.recordTagRow}>
           {(doc.tags || []).slice(0, 3).map((tag) => (
             <Text key={tag} style={styles.recordTag}>{tag}</Text>
@@ -1124,7 +2023,7 @@ function EnterpriseRecordCard({ doc, onPress }) {
           {doc.originalSaved && <Text style={styles.recordTag}>original saved</Text>}
         </View>
         <ChevronRight size={18} color={C.primary} />
-      </View>
+      </View>}
     </TouchableOpacity>
   );
 }
@@ -1351,10 +2250,17 @@ function AnalysisScreen({ nav, app, params }) {
   useEffect(() => {
     if (!doc || startedRef.current) return undefined;
 
-    if (doc.status === "ready" || doc.status === "needs_review") {
+    if (doc.status === "ready" || isReuploadStatus(doc.status)) {
       setProgress(100);
-      setStage(doc.status === "ready" ? "Analysis complete" : "Manual review required");
+      setStage(doc.status === "ready" ? "Analysis complete" : "Reupload needed");
       setError(doc.aiError || "");
+      return undefined;
+    }
+
+    if (doc.status === "processing" || doc.status === "ocr_complete") {
+      setProgress(doc.status === "ocr_complete" ? 82 : 48);
+      setStage(doc.status === "ocr_complete" ? "Writing summary and grouping record" : "Processing in background");
+      setError("");
       return undefined;
     }
 
@@ -1362,60 +2268,24 @@ function AnalysisScreen({ nav, app, params }) {
     let active = true;
 
     const runPipeline = async () => {
-      const files = doc.localFiles?.length
-        ? doc.localFiles
-        : doc.localUri
-          ? [{ uri: doc.localUri, name: doc.fileName, mimeType: doc.mimeType }]
-          : [];
-
       try {
-        if (!files.length) {
-          throw new Error("Original file is missing from local storage.");
-        }
-
-        app.updateDocPatch(doc.id, { status: "processing", summary: "OCR is running on the uploaded file." });
-        const pageTexts = [];
-
-        for (let i = 0; i < files.length; i += 1) {
-          if (!active) return;
-          setStage(`Running OCR on file ${i + 1} of ${files.length}`);
-          setProgress(Math.min(70, 22 + Math.round((i / files.length) * 42)));
-          const ocr = await requestOcr(files[i]);
-          pageTexts.push(...(ocr.pageLevelText?.length ? ocr.pageLevelText : [{ page: i + 1, text: ocr.ocrText || "" }]));
-        }
-
-        const combinedText = pageTexts.map((page, index) => `Page ${page.page || index + 1}\n${page.text || ""}`).join("\n\n").trim();
-        app.updateDocPatch(doc.id, {
-          ocr: combinedText,
-          pageLevelText: pageTexts,
-          status: "ocr_complete",
-          summary: "OCR complete. AI analysis is running.",
+        const updated = await runDocumentPipeline(doc, app, {
+          isActive: () => active,
+          setStage,
+          setProgress,
         });
 
         if (!active) return;
-        setStage("Summarizing and categorizing with AI");
-        setProgress(82);
-        const analysis = await requestDocumentAnalysis(doc, combinedText);
-        const updated = applyAnalysisToDoc({ ...doc, ocr: combinedText, pageLevelText: pageTexts }, analysis, combinedText);
-        app.updateDoc(updated);
-
-        if (!active) return;
-        setError(updated.aiError || "");
-        setStage(updated.status === "ready" ? "Analysis complete" : "Manual review required");
+        setError(updated?.aiError || "");
+        setStage(updated?.status === "ready" ? "Analysis complete" : "Reupload needed");
         setProgress(100);
       } catch (caught) {
-        const message = caught?.message === "Network request failed"
-          ? "Network unavailable. Original file is saved and this record needs review."
-          : caught?.message || "Processing failed. Original file is saved and this record needs review.";
-        app.updateDocPatch(doc.id, {
-          status: "needs_review",
-          needsReview: true,
-          aiError: message,
-          summary: "Original file saved. Complete OCR or metadata review manually.",
-        });
+        const patch = processingFailurePatch(caught);
+        const message = patch.aiError;
+        app.updateDocPatch(doc.id, patch);
         if (active) {
           setError(message);
-          setStage("Manual review required");
+          setStage("Reupload needed");
           setProgress(100);
         }
       }
@@ -1428,7 +2298,8 @@ function AnalysisScreen({ nav, app, params }) {
   }, [doc?.id, runId]);
 
   const currentDoc = app.docs.find((item) => item.id === params?.docId) || doc;
-  const done = currentDoc?.status === "ready" || currentDoc?.status === "needs_review" || progress >= 100;
+  const done = currentDoc?.status === "ready" || isReuploadStatus(currentDoc?.status) || progress >= 100;
+  const needsReupload = isReuploadStatus(currentDoc?.status);
   const isImageDoc = currentDoc?.mimeType?.startsWith("image/");
   const retryProcessing = () => {
     if (!currentDoc) return;
@@ -1447,7 +2318,7 @@ function AnalysisScreen({ nav, app, params }) {
 
   useEffect(() => {
     if (!currentDoc || done) return undefined;
-    const max = stage.includes("Summarizing") ? 94 : 76;
+    const max = stage.includes("Summarizing") || stage.includes("Structuring") ? 94 : 76;
     const timer = setInterval(() => {
       setProgress((value) => (value < max ? Math.min(max, value + 1) : value));
     }, 520);
@@ -1488,9 +2359,10 @@ function AnalysisScreen({ nav, app, params }) {
           <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${progress}%` }]} /></View>
           <View style={styles.analysisSteps}>
             <AnalysisStep label="Original saved" done />
-            <AnalysisStep label="OCR" done={progress >= 70 || !!currentDoc.ocr} active={progress < 82 && !done} />
-            <AnalysisStep label="AI summary" done={currentDoc.status === "ready"} active={progress >= 82 && !done} />
-            <AnalysisStep label="Review" done={done} active={currentDoc.status === "needs_review"} />
+            <AnalysisStep label="OCR" done={progress >= 70 || !!currentDoc.ocr} active={progress < 78 && !done} />
+            <AnalysisStep label="Structured text" done={!!currentDoc.structuredOcr || currentDoc.status === "ready"} active={progress >= 78 && progress < 92 && !done} />
+            <AnalysisStep label="AI summary" done={currentDoc.status === "ready"} active={progress >= 92 && !done} />
+            <AnalysisStep label={needsReupload ? "Reupload" : "Result"} done={done} active={needsReupload} />
           </View>
           {!!error && <Text style={styles.analysisError}>{error}</Text>}
         </Card>
@@ -1510,16 +2382,16 @@ function AnalysisScreen({ nav, app, params }) {
 
         <View style={styles.insightGrid}>
           <MiniInsight icon={FileCheck2} label="Category" value={categoryFor(currentDoc.category).label} tone="blue" />
-          <MiniInsight icon={Building2} label="Hospital" value={currentDoc.hospital || "Needs review"} tone="green" />
+          <MiniInsight icon={Building2} label="Hospital" value={currentDoc.hospital || "Not found yet"} tone="green" />
         </View>
-        {currentDoc.status === "needs_review" ? (
+        {needsReupload ? (
           <View style={styles.twoCol}>
             <AppButton tone="soft" icon={RefreshCcw} onPress={retryProcessing} style={styles.flexFill}>Retry</AppButton>
-            <AppButton icon={Edit3} onPress={() => nav.push("ocrReview", { method: params?.method, docId: currentDoc.id })} style={styles.flexFill}>Review</AppButton>
+            <AppButton icon={RefreshCcw} onPress={() => app.reuploadDoc?.(currentDoc.id)} style={styles.flexFill}>Reupload</AppButton>
           </View>
         ) : (
-          <AppButton disabled={!done} icon={Edit3} onPress={() => nav.push("ocrReview", { method: params?.method, docId: currentDoc.id })} style={[styles.fullWidth, { marginTop: 18 }]}>
-            {done ? "Review and save" : "Processing..."}
+          <AppButton disabled={!done} icon={FolderOpen} onPress={() => nav.go("records")} style={[styles.fullWidth, { marginTop: 18 }]}>
+            {done ? "Open records" : "Processing..."}
           </AppButton>
         )}
       </View>
@@ -1626,17 +2498,18 @@ function MiniInsight({ icon: Icon, label, value, tone }) {
 function OCRReview({ nav, app, params }) {
   const incoming = params?.docId ? app.docs.find((doc) => doc.id === params.docId) : params?.doc;
   const [form, setForm] = useState({
-    title: incoming?.title || "CBC Lab Report",
-    category: incoming?.category || "reports",
-    tags: incoming?.tags?.join(", ") || "cbc, blood, annual",
-    hospital: incoming?.hospital || "MediCare Labs",
-    doctor: incoming?.doctor || "Dr. Rhea Kapoor",
-    visitDate: incoming?.date || "9 Jul 2026",
-    ocr: incoming?.ocr || "Complete blood count report. Hemoglobin 13.2 g/dL, WBC within normal range, platelets normal. Reviewed by Dr. Rhea Kapoor.",
+    title: incoming?.title || "Medical document",
+    category: incoming?.category || "others",
+    tags: incoming?.tags?.join(", ") || "",
+    hospital: incoming?.hospital || "",
+    doctor: incoming?.doctor || "",
+    visitDate: incoming?.date || "",
+    ocr: incoming?.ocr || "",
+    structuredText: structuredTextForDoc(incoming) || "",
     summary: incoming?.summary || "",
   });
 
-  const save = () => {
+  const save = async () => {
     const nextDoc = {
       ...incoming,
       id: incoming?.id || `d${Date.now()}`,
@@ -1649,12 +2522,45 @@ function OCRReview({ nav, app, params }) {
       tags: form.tags.split(",").map((x) => x.trim()).filter(Boolean),
       pages: incoming?.pages || 2,
       ocr: form.ocr,
-      summary: form.summary || "Saved after manual review.",
+      structuredOcr: incoming?.structuredOcr
+        ? { ...incoming.structuredOcr, formattedText: form.structuredText }
+        : {
+          status: "ready",
+          rawText: form.ocr,
+          lineCount: form.structuredText.split(/\r?\n/).filter((line) => line.trim()).length,
+          formattedText: form.structuredText,
+          sections: [{ title: "Extracted text", lineNumbers: [] }],
+          keyValuePairs: [],
+          tables: [],
+          warnings: [],
+        },
+      summary: form.summary || "Saved after edit.",
+      clinicalSummary: incoming?.clinicalSummary || "",
+      importantFindings: [],
+      medicines: incoming?.medicines || [],
+      tests: incoming?.tests || [],
+      ocrConfidence: incoming?.ocrConfidence,
+      extractionMode: incoming?.extractionMode,
+      verifiedFacts: incoming?.verifiedFacts || [],
+      rejectedFacts: incoming?.rejectedFacts || [],
+      verification: incoming?.verification,
       status: "ready",
       needsReview: false,
       aiError: "",
     };
     if (incoming) {
+      if (app.authToken) {
+        await requestUpdateDocument(app.authToken, nextDoc.documentId || nextDoc.id, {
+          title: nextDoc.title,
+          category: nextDoc.category,
+          hospital: nextDoc.hospital,
+          doctor: nextDoc.doctor,
+          visitDate: nextDoc.date,
+          tags: nextDoc.tags,
+          summary: nextDoc.summary,
+          structuredOcr: nextDoc.structuredOcr,
+        }).catch(() => undefined);
+      }
       app.updateDoc(nextDoc);
       nav.go("records", { category: nextDoc.category });
     } else {
@@ -1667,9 +2573,9 @@ function OCRReview({ nav, app, params }) {
     <Screen bottomPad={34}>
       <Header nav={nav} app={app} title="Save Document" back />
       <View style={styles.pageBody}>
-        <Card style={[styles.ocrBanner, { backgroundColor: incoming?.status === "needs_review" ? C.amberSoft : C.greenSoft }]}>
-          <Sparkles size={18} color={incoming?.status === "needs_review" ? C.amber : C.green} />
-          <Text style={styles.ocrBannerText}>{incoming?.status === "needs_review" ? "Review required. Original file and OCR text are saved." : "OCR text and metadata are ready for correction."}</Text>
+        <Card style={[styles.ocrBanner, { backgroundColor: isReuploadStatus(incoming?.status) ? C.redSoft : C.greenSoft }]}>
+          <Sparkles size={18} color={isReuploadStatus(incoming?.status) ? C.red : C.green} />
+          <Text style={styles.ocrBannerText}>{isReuploadStatus(incoming?.status) ? "Reupload needed. Original file is saved." : "OCR text and metadata are ready for correction."}</Text>
         </Card>
         <Field label="Rename document" value={form.title} onChangeText={(title) => setForm({ ...form, title })} icon={FileText} />
         <Text style={styles.fieldLabel}>Category</Text>
@@ -1681,7 +2587,8 @@ function OCRReview({ nav, app, params }) {
         <Field label="Hospital name" value={form.hospital} onChangeText={(hospital) => setForm({ ...form, hospital })} icon={Building2} />
         <Field label="Doctor name" value={form.doctor} onChangeText={(doctor) => setForm({ ...form, doctor })} icon={Stethoscope} />
         <Field label="Visit date" value={form.visitDate} onChangeText={(visitDate) => setForm({ ...form, visitDate })} icon={CalendarClock} />
-        <Field label="Extracted text" value={form.ocr} onChangeText={(ocr) => setForm({ ...form, ocr })} icon={FileCheck2} multiline />
+        <Field label="Clean extracted text" value={form.structuredText} onChangeText={(structuredText) => setForm({ ...form, structuredText })} icon={FileCheck2} multiline />
+        <Field label="Raw OCR text" value={form.ocr} onChangeText={(ocr) => setForm({ ...form, ocr })} icon={FileText} multiline />
         <AppButton icon={ShieldCheck} onPress={save} style={styles.fullWidth}>{incoming ? "Save changes" : "Save document"}</AppButton>
       </View>
     </Screen>
@@ -1696,6 +2603,8 @@ function DocumentDetail({ nav, app, params }) {
   const [rotation, setRotation] = useState(0);
   const [full, setFull] = useState(false);
   const isImageDoc = doc?.mimeType?.startsWith("image/");
+  const summaryText = doc?.summary || doc?.clinicalSummary || "";
+  const structuredText = structuredTextForDoc(doc);
 
   return (
     <Screen bottomPad={34}>
@@ -1723,25 +2632,41 @@ function DocumentDetail({ nav, app, params }) {
           </View>
           <StatusPill status={doc.status || "ready"} />
         </View>
-        {!!doc.summary && (
-          <Card style={[styles.infoPanel, { backgroundColor: C.greenSoft }]}>
-            <Text style={styles.ocrTitle}>AI summary</Text>
-            <Text style={styles.ocrText}>{doc.summary}</Text>
-          </Card>
-        )}
         <Card style={styles.infoPanel}>
+          <View style={styles.insightPanelHeader}>
+            <FileCheck2 size={17} color={C.primary} />
+            <Text style={styles.ocrTitle}>Document details</Text>
+          </View>
+          <InfoRow label="Category" value={cat.label} />
+          <InfoRow label="Patient" value={doc.patientName} />
           <InfoRow label="Doctor" value={doc.doctor} />
           <InfoRow label="Hospital" value={doc.hospital} />
           <InfoRow label="Visit date" value={doc.date} />
           <InfoRow label="Tags" value={(doc.tags || []).join(", ")} />
+          <InfoRow label="OCR provider" value={providerLabel(doc.ocrProvider)} />
+          <InfoRow label="OCR confidence" value={percentLabel(doc.ocrConfidence)} />
         </Card>
-        <Card style={[styles.infoPanel, { backgroundColor: C.blueSoft }]}>
-          <Text style={styles.ocrTitle}>Searchable OCR text</Text>
-          <Text style={styles.ocrText}>{doc.ocr}</Text>
-        </Card>
+        {!!summaryText && (
+          <Card style={[styles.infoPanel, { backgroundColor: C.greenSoft }]}>
+            <View style={styles.insightPanelHeader}>
+              <Sparkles size={17} color={C.green} />
+              <Text style={styles.ocrTitle}>AI summary</Text>
+            </View>
+            <Text style={styles.ocrText}>{summaryText}</Text>
+          </Card>
+        )}
+        {!!structuredText && (
+          <Card style={styles.infoPanel}>
+            <View style={styles.insightPanelHeader}>
+              <FileText size={17} color={C.blue} />
+              <Text style={styles.ocrTitle}>Clean extracted text</Text>
+            </View>
+            <ReportText text={structuredText} />
+          </Card>
+        )}
         <View style={styles.twoCol}>
           <AppButton tone="soft" icon={Edit3} onPress={() => nav.push("ocrReview", { docId: doc.id })} style={styles.flexFill}>Edit metadata</AppButton>
-          <AppButton tone="soft" icon={Share2} style={styles.flexFill}>Share</AppButton>
+          <AppButton tone="soft" icon={Share2} onPress={() => shareDocument(doc)} style={styles.flexFill}>Share</AppButton>
         </View>
         <AppButton tone="danger" icon={Trash2} onPress={() => { app.deleteDoc(doc.id); nav.go("records"); }} style={[styles.fullWidth, { marginTop: 10 }]}>Delete document</AppButton>
       </View>
@@ -1752,6 +2677,135 @@ function DocumentDetail({ nav, app, params }) {
         </View>
       </Modal>
     </Screen>
+  );
+}
+
+function stripInlineHtml(value = "") {
+  return String(value || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function htmlTableRows(block = "") {
+  const rows = [...String(block).matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+  return rows.map((row) => {
+    const cells = [...row[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)];
+    return cells.map((cell) => stripInlineHtml(cell[1])).filter(Boolean);
+  }).filter((row) => row.length);
+}
+
+function markdownTableRows(lines = []) {
+  return lines
+    .map((line) => line.trim())
+    .filter((line) => line.includes("|"))
+    .map((line) => line.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim()))
+    .filter((row) => row.some((cell) => cell && !/^:?-{2,}:?$/.test(cell)));
+}
+
+function ReportTable({ rows }) {
+  if (!rows?.length) return null;
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.reportTableScroll}>
+      <View style={styles.reportTable}>
+        {rows.map((row, rowIndex) => (
+          <View key={`row-${rowIndex}`} style={[styles.reportTableRow, rowIndex === 0 && styles.reportTableHeaderRow]}>
+            {row.map((cell, cellIndex) => (
+              <Text key={`cell-${rowIndex}-${cellIndex}`} style={[styles.reportTableCell, rowIndex === 0 && styles.reportTableHeaderCell]}>
+                {cell || "-"}
+              </Text>
+            ))}
+          </View>
+        ))}
+      </View>
+    </ScrollView>
+  );
+}
+
+function ReportText({ text }) {
+  const blocks = cleanReadableText(text).split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  if (!blocks.length) return null;
+
+  return (
+    <View style={styles.reportTextWrap}>
+      {blocks.map((block, blockIndex) => {
+        const lines = block.split("\n").filter(Boolean);
+        if (/<table/i.test(block)) {
+          return <ReportTable key={`block-${blockIndex}`} rows={htmlTableRows(block)} />;
+        }
+        if (lines.length > 1 && lines.every((line) => line.includes("|"))) {
+          return <ReportTable key={`block-${blockIndex}`} rows={markdownTableRows(lines)} />;
+        }
+
+        return (
+          <View key={`block-${blockIndex}`} style={styles.reportBlock}>
+            {lines.map((line, lineIndex) => {
+              const heading = line.match(/^(#{1,6})\s+(.+)/);
+              if (heading) {
+                return <Text key={`line-${lineIndex}`} style={styles.reportHeading}>{heading[2]}</Text>;
+              }
+              const bullet = line.match(/^\s*[-*]\s+(.+)/);
+              if (bullet) {
+                return (
+                  <View key={`line-${lineIndex}`} style={styles.reportBulletRow}>
+                    <View style={styles.reportBulletDot} />
+                    <Text style={styles.reportText}>{bullet[1]}</Text>
+                  </View>
+                );
+              }
+              return <Text key={`line-${lineIndex}`} style={styles.reportText}>{stripInlineHtml(line)}</Text>;
+            })}
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function InsightList({ title, items, icon: Icon, tone = "pink" }) {
+  const cleanItems = Array.isArray(items) ? items.map((item) => String(item).trim()).filter(Boolean) : [];
+  if (!cleanItems.length) return null;
+  const map = {
+    pink: [C.blush, C.primary],
+    blue: [C.blueSoft, C.blue],
+    green: [C.greenSoft, C.green],
+  };
+  const [bg, fg] = map[tone] || map.pink;
+
+  return (
+    <Card style={[styles.infoPanel, { backgroundColor: bg }]}>
+      <View style={styles.insightPanelHeader}>
+        <Icon size={17} color={fg} />
+        <Text style={styles.ocrTitle}>{title}</Text>
+      </View>
+      {cleanItems.map((item, index) => (
+        <View key={`${title}-${index}`} style={styles.insightItem}>
+          <View style={[styles.insightDot, { backgroundColor: fg }]} />
+          <Text style={styles.insightItemText}>{item}</Text>
+        </View>
+      ))}
+    </Card>
+  );
+}
+
+function VerifiedFactsPanel({ facts }) {
+  const cleanFacts = Array.isArray(facts) ? facts.filter((fact) => fact?.value && fact?.evidence).slice(0, 6) : [];
+  if (!cleanFacts.length) return null;
+
+  return (
+    <Card style={styles.infoPanel}>
+      <View style={styles.insightPanelHeader}>
+        <BadgeCheck size={17} color={C.green} />
+        <Text style={styles.ocrTitle}>Verified facts</Text>
+      </View>
+      {cleanFacts.map((fact, index) => (
+        <View key={`${fact.label || fact.type}-${index}`} style={styles.verifiedFactItem}>
+          <Text style={styles.verifiedFactText}>{fact.label || fact.type}: {fact.value}{fact.unit ? ` ${fact.unit}` : ""}</Text>
+          <Text style={styles.verifiedEvidence} numberOfLines={2}>Evidence: {fact.evidence}</Text>
+        </View>
+      ))}
+    </Card>
   );
 }
 
@@ -1775,8 +2829,8 @@ function InfoRow({ label, value }) {
 function ProfileScreen({ nav, app }) {
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState(app.user);
-  const save = () => {
-    app.setUser(form);
+  const save = async () => {
+    await app.saveUserProfile?.(form);
     setEditing(false);
   };
   return (
@@ -1811,7 +2865,7 @@ function ProfileScreen({ nav, app }) {
             <SectionTitle text="Account" />
             <ListAction icon={Lock} title="Secure session" subtitle="Mobile OTP verified" />
             <ListAction icon={Download} title="Export documents" subtitle="Encrypted archive" />
-            <ListAction icon={X} title="Logout" subtitle="End this sample session" onPress={() => nav.go("welcome")} />
+            <ListAction icon={X} title="Logout" subtitle="End this secure session" onPress={app.logout} />
             <ListAction icon={Trash2} title="Delete account" subtitle="Remove vault and metadata" danger onPress={() => nav.go("welcome")} />
           </>
         )}
@@ -1941,15 +2995,71 @@ export default function App() {
   const [stack, setStack] = useState([{ screen: "splash" }]);
   const [fabOpen, setFabOpen] = useState(false);
   const [user, setUser] = useState(initialUser);
-  const [docs, setDocs] = useState(initialDocs);
+  const [docs, setDocs] = useState([]);
+  const [authToken, setAuthToken] = useState("");
+  const [bootstrapped, setBootstrapped] = useState(false);
+  const processingIdsRef = useRef(new Set());
 
   useEffect(() => {
-    if (stack.length === 1 && stack[0].screen === "splash") {
-      const t = setTimeout(() => setStack([{ screen: "welcome" }]), 1500);
-      return () => clearTimeout(t);
+    if (Platform.OS === "android") {
+      NativeStatusBar.setHidden(true, "fade");
+      NativeStatusBar.setTranslucent(true);
     }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const boot = async () => {
+      const saved = await readSavedState();
+      const savedToken = saved?.token || "";
+      const savedUser = saved?.user ? normalizeServerUser(saved.user) : initialUser;
+      const savedDocs = Array.isArray(saved?.docs) ? saved.docs.map(withRecordGroup) : [];
+
+      if (active) {
+        setAuthToken(savedToken);
+        setUser(savedUser);
+        setDocs(savedDocs);
+      }
+
+      if (!savedToken) {
+        if (active) {
+          setStack([{ screen: "welcome" }]);
+          setBootstrapped(true);
+        }
+        return;
+      }
+
+      try {
+        const [me, remote] = await Promise.all([requestMe(savedToken), requestDocuments(savedToken)]);
+        const nextUser = normalizeServerUser(me.user);
+        const nextDocs = mergeRemoteDocuments(savedDocs, remote.documents || []);
+        if (!active) return;
+        setUser(nextUser);
+        setDocs(nextDocs);
+        setStack([{ screen: "home" }]);
+        setBootstrapped(true);
+        await writeSavedState({ token: savedToken, user: nextUser, docs: nextDocs });
+      } catch {
+        await clearSavedState();
+        if (!active) return;
+        setAuthToken("");
+        setUser(initialUser);
+        setDocs([]);
+        setStack([{ screen: "welcome" }]);
+        setBootstrapped(true);
+      }
+    };
+    boot();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!bootstrapped) return undefined;
+    writeSavedState({ token: authToken, user, docs }).catch(() => undefined);
     return undefined;
-  }, [stack]);
+  }, [bootstrapped, authToken, user, docs]);
 
   const push = useCallback((screen, params) => setStack((s) => [...s, { screen, params }]), []);
   const pop = useCallback(() => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s)), []);
@@ -1958,35 +3068,149 @@ export default function App() {
     setStack([{ screen, params }]);
   }, []);
   const startUpload = useCallback(async (method) => {
+    if (!authToken) {
+      Alert.alert("Login required", "Please login or create an account before uploading medical documents.");
+      go("welcome");
+      return;
+    }
     try {
       const assets = await pickUploadAssets(method);
       if (!assets?.length) return;
       const localFiles = await copyAssetsToVault(assets, method);
-      const draft = createDraftDocument(method, localFiles);
-      setDocs((existing) => [draft, ...existing]);
-      push("analysis", { method, docId: draft.id });
+      const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const drafts = method === "gallery" && localFiles.length > 1
+        ? localFiles.map((file, index) => createDraftDocument(method, [file], index, batchId))
+        : [createDraftDocument(method, localFiles, 0, batchId)];
+      setDocs((existing) => [...drafts, ...existing]);
+      go("records");
     } catch (error) {
       Alert.alert("Upload failed", error?.message || "Could not import this document.");
     }
-  }, [push]);
+  }, [authToken, go]);
+  const reuploadDoc = useCallback(async (docId, method = "gallery") => {
+    if (!authToken) {
+      Alert.alert("Login required", "Please login before reuploading medical documents.");
+      go("welcome");
+      return;
+    }
+    const target = docs.find((doc) => doc.id === docId);
+    if (!target) return;
+
+    try {
+      const assets = await pickUploadAssets(method);
+      if (!assets?.length) return;
+      const localFiles = await copyAssetsToVault(assets.slice(0, 1), method);
+      const replacement = localFiles[0];
+      if (!replacement) return;
+      setDocs((existingDocs) => existingDocs.map((doc) => {
+        if (doc.id !== docId) return doc;
+        return withRecordGroup({
+          ...doc,
+          title: titleFromFileName(replacement.name || doc.title || "Medical document"),
+          sortDate: Date.now(),
+          fileName: replacement.name || doc.fileName,
+          mimeType: replacement.mimeType || doc.mimeType,
+          localUri: replacement.uri,
+          localFiles: [replacement],
+          pages: 1,
+          ocr: "",
+          structuredOcr: null,
+          pageLevelText: [],
+          summary: "Replacement saved. OCR and AI are running again.",
+          status: "queued",
+          needsReview: false,
+          aiError: "",
+          warnings: [],
+          originalSaved: true,
+          uploadSource: method,
+        });
+      }));
+      go("records");
+    } catch (error) {
+      Alert.alert("Reupload failed", error?.message || "Could not replace this file.");
+    }
+  }, [authToken, docs, go]);
+  const refreshDocuments = useCallback(async () => {
+    if (!authToken) return [];
+    const remote = await requestDocuments(authToken);
+    const nextDocs = mergeRemoteDocuments(docs, remote.documents || []);
+    setDocs(nextDocs);
+    return nextDocs;
+  }, [authToken, docs]);
+  const saveUserProfile = useCallback(async (profile) => {
+    const nextUser = authToken
+      ? normalizeServerUser((await requestProfileUpdate(authToken, profile)).user)
+      : normalizeServerUser(profile);
+    setUser(nextUser);
+    return nextUser;
+  }, [authToken]);
+  const finishAuth = useCallback(async ({ token, user: nextUser }) => {
+    const normalizedUser = normalizeServerUser(nextUser);
+    setAuthToken(token || "");
+    setUser(normalizedUser);
+    let nextDocs = [];
+    if (token) {
+      const remote = await requestDocuments(token).catch(() => ({ documents: [] }));
+      nextDocs = mergeRemoteDocuments([], remote.documents || []);
+    }
+    setDocs(nextDocs);
+    await writeSavedState({ token, user: normalizedUser, docs: nextDocs });
+    return { user: normalizedUser, docs: nextDocs };
+  }, []);
+  const logout = useCallback(async () => {
+    await requestLogout(authToken);
+    await clearSavedState();
+    setAuthToken("");
+    setUser(initialUser);
+    setDocs([]);
+    setFabOpen(false);
+    setStack([{ screen: "welcome" }]);
+  }, [authToken]);
   const nav = { push, pop, go };
   const app = {
+    authToken,
     user,
-    setUser,
+    setUser: (nextUser) => setUser(normalizeServerUser(nextUser)),
+    saveUserProfile,
+    finishAuth,
+    logout,
+    refreshDocuments,
     docs,
-    addDoc: (doc) => setDocs((d) => [doc, ...d]),
-    updateDoc: (doc) => setDocs((d) => d.map((existing) => (existing.id === doc.id ? doc : existing))),
-    updateDocPatch: (id, patch) => setDocs((d) => d.map((existing) => (existing.id === id ? { ...existing, ...patch } : existing))),
-    deleteDoc: (id) => setDocs((d) => d.filter((doc) => doc.id !== id)),
+    addDoc: (doc) => setDocs((d) => [withRecordGroup(doc), ...d]),
+    updateDoc: (doc) => setDocs((d) => d.map((existing) => (existing.id === doc.id ? withRecordGroup(doc) : existing))),
+    updateDocPatch: (id, patch) => setDocs((d) => d.map((existing) => (existing.id === id ? withRecordGroup({ ...existing, ...patch }) : existing))),
+    deleteDoc: async (id) => {
+      if (authToken) await requestDeleteDocument(authToken, id).catch(() => undefined);
+      setDocs((d) => d.filter((doc) => doc.id !== id));
+    },
     startUpload,
+    reuploadDoc,
   };
+
+  useEffect(() => {
+    const queued = docs.filter((doc) => doc.status === "queued" && !processingIdsRef.current.has(doc.id));
+    if (!queued.length) return undefined;
+
+    queued.forEach((doc) => {
+      processingIdsRef.current.add(doc.id);
+      runDocumentPipeline(doc, app)
+        .catch((error) => {
+          app.updateDocPatch(doc.id, processingFailurePatch(error));
+        })
+        .finally(() => {
+          processingIdsRef.current.delete(doc.id);
+        });
+    });
+
+    return undefined;
+  }, [docs]);
 
   const current = stack[stack.length - 1];
   const screens = {
     splash: <Splash />,
     welcome: <Welcome nav={nav} />,
-    phone: <PhoneEntry nav={nav} />,
-    otp: <OTP nav={nav} />,
+    phone: <PhoneEntry nav={nav} params={current.params} />,
+    otp: <OTP nav={nav} app={app} params={current.params} />,
     onboarding: <Onboarding nav={nav} app={app} />,
     home: <HomeScreen nav={nav} app={app} />,
     records: <RecordsScreen nav={nav} app={app} params={current.params} />,
@@ -1994,6 +3218,7 @@ export default function App() {
     uploadPreview: <UploadPreview nav={nav} app={app} params={current.params} />,
     analysis: <AnalysisScreen nav={nav} app={app} params={current.params} />,
     ocrReview: <OCRReview nav={nav} app={app} params={current.params} />,
+    recordGroup: <RecordGroupDetail nav={nav} app={app} params={current.params} />,
     document: <DocumentDetail nav={nav} app={app} params={current.params} />,
     profile: <ProfileScreen nav={nav} app={app} />,
     settings: <SettingsScreen nav={nav} app={app} />,
@@ -2003,16 +3228,15 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.app}>
-      <StatusBar style="dark" backgroundColor={C.bg} />
+      <StatusBar hidden />
       <LinearGradient colors={["#FBFCFD", "#F3F5F8"]} style={StyleSheet.absoluteFill} />
-      {showChrome && <NativeStatus />}
       <View style={styles.routeWrap}>{screens[current.screen] || screens.home}</View>
       {showChrome && isRoot && <BottomNav current={current.screen} nav={nav} fabOpen={fabOpen} setFabOpen={setFabOpen} onUpload={startUpload} />}
     </SafeAreaView>
   );
 }
 
-const topInset = Platform.OS === "android" ? NativeStatusBar.currentHeight || 0 : 0;
+const topInset = 0;
 
 const styles = StyleSheet.create({
   app: {
@@ -2303,6 +3527,13 @@ const styles = StyleSheet.create({
     color: C.ink,
     fontWeight: "800",
   },
+  countryInput: {
+    minWidth: 54,
+    color: C.ink,
+    fontWeight: "900",
+    fontSize: 15,
+    padding: 0,
+  },
   phoneInput: {
     flex: 1,
     height: 54,
@@ -2466,6 +3697,98 @@ const styles = StyleSheet.create({
     color: C.text,
     marginTop: 7,
     marginBottom: 18,
+  },
+  homeHeroCard: {
+    borderRadius: 22,
+    padding: 20,
+    minHeight: 244,
+    borderWidth: 1,
+    borderColor: "#FFD4E2",
+    shadowColor: C.primary,
+    shadowOpacity: 0.14,
+    shadowOffset: { width: 0, height: 18 },
+    shadowRadius: 28,
+    elevation: 5,
+    overflow: "hidden",
+  },
+  homeHeroTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  homeHeroMark: {
+    width: 58,
+    height: 58,
+    borderRadius: 20,
+    backgroundColor: "rgba(255,255,255,0.72)",
+    borderWidth: 1,
+    borderColor: "rgba(116,22,54,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  homeHeroEyebrow: {
+    color: C.primary,
+    fontSize: 11.5,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  homeHeroTitle: {
+    color: C.ink,
+    fontSize: 25,
+    lineHeight: 30,
+    fontWeight: "900",
+    marginTop: 4,
+  },
+  homeHeroText: {
+    color: C.text,
+    fontSize: 13.5,
+    lineHeight: 20,
+    marginTop: 15,
+    maxWidth: 300,
+  },
+  homeHeroStats: {
+    minHeight: 72,
+    borderRadius: 18,
+    backgroundColor: "rgba(255,255,255,0.62)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.78)",
+    marginTop: 18,
+    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  homeHeroNumber: {
+    color: C.primary,
+    fontSize: 22,
+    fontWeight: "900",
+  },
+  homeHeroLabel: {
+    color: C.text,
+    fontSize: 11.5,
+    fontWeight: "800",
+    marginTop: 2,
+  },
+  homeHeroDivider: {
+    width: 1,
+    height: 34,
+    backgroundColor: "rgba(116,22,54,0.14)",
+  },
+  homeHeroAction: {
+    minHeight: 48,
+    borderRadius: 16,
+    backgroundColor: C.primary,
+    marginTop: 16,
+    paddingHorizontal: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  homeHeroActionText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "900",
   },
   homeStats: {
     flexDirection: "row",
@@ -2752,6 +4075,30 @@ const styles = StyleSheet.create({
     marginTop: 14,
     borderRadius: 18,
   },
+  recordsModeTabs: {
+    minHeight: 40,
+    flexDirection: "row",
+    gap: 0,
+    marginTop: 8,
+    marginBottom: 2,
+  },
+  drawerModeButton: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 0,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 6,
+  },
+  drawerModeButtonActive: {
+    backgroundColor: "transparent",
+  },
+  drawerModeText: {
+    color: C.muted,
+    fontSize: 12,
+    fontWeight: "900",
+  },
   recordsCategoryStrip: {
     gap: 9,
     paddingBottom: 3,
@@ -2793,7 +4140,266 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   recordsList: {
+    gap: 18,
+  },
+  recordGroupCard: {
+    position: "relative",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#E8D5DD",
+    backgroundColor: "#FFF9F2",
+    padding: 14,
+    paddingTop: 22,
+    shadowColor: C.primary,
+    shadowOpacity: 0.1,
+    shadowOffset: { width: 0, height: 16 },
+    shadowRadius: 28,
+    elevation: 4,
+  },
+  folderTab: {
+    position: "absolute",
+    top: -10,
+    left: 18,
+    minWidth: 124,
+    height: 26,
+    borderTopLeftRadius: 12,
+    borderTopRightRadius: 12,
+    borderWidth: 1,
+    borderBottomWidth: 0,
+    borderColor: "#E8D5DD",
+    backgroundColor: "#FFF9F2",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  folderTabText: {
+    color: C.primary,
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  recordGroupHeader: {
+    minHeight: 58,
+    flexDirection: "row",
+    alignItems: "center",
     gap: 12,
+  },
+  recordGroupIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F8E4EC",
+    borderWidth: 1,
+    borderColor: "#EFD1DC",
+  },
+  recordGroupTitle: {
+    color: C.ink,
+    fontSize: 17.5,
+    fontWeight: "900",
+  },
+  recordGroupSub: {
+    color: C.muted,
+    fontSize: 12.4,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  recordGroupMetaRow: {
+    minHeight: 34,
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 12,
+  },
+  recordGroupMetric: {
+    minHeight: 30,
+    borderRadius: 999,
+    backgroundColor: "rgba(116,22,54,0.07)",
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  recordGroupReviewMetric: {
+    backgroundColor: C.amberSoft,
+  },
+  recordGroupMeta: {
+    color: C.primary,
+    fontSize: 11.5,
+    fontWeight: "900",
+  },
+  groupDocsList: {
+    gap: 9,
+    marginTop: 12,
+  },
+  drawerFileStack: {
+    marginTop: 10,
+    gap: 8,
+  },
+  drawerFileRow: {
+    minHeight: 60,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: "#EFE1E5",
+    backgroundColor: "#FFFFFF",
+    padding: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  drawerFileRowOverlap: {
+    marginTop: -1,
+  },
+  drawerFileStripe: {
+    width: 4,
+    alignSelf: "stretch",
+    borderRadius: 4,
+  },
+  drawerFileTitle: {
+    color: C.ink,
+    fontSize: 13.5,
+    fontWeight: "900",
+  },
+  drawerFileMeta: {
+    color: C.muted,
+    fontSize: 11.5,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  drawerMoreRow: {
+    minHeight: 42,
+    borderRadius: 12,
+    backgroundColor: C.blush,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  drawerMoreText: {
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  recordGroupOpenRow: {
+    minHeight: 38,
+    marginTop: 12,
+    borderRadius: 12,
+    backgroundColor: "rgba(116,22,54,0.07)",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  recordGroupOpenText: {
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  groupDetailHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginBottom: 14,
+  },
+  groupOriginalViewer: {
+    padding: 14,
+    borderRadius: 16,
+  },
+  groupViewerTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  groupViewerTitle: {
+    color: C.ink,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  groupViewerCount: {
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  groupPreviewStage: {
+    height: 370,
+    borderRadius: 14,
+    backgroundColor: C.bg2,
+    overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  groupPreviewImage: {
+    width: 320,
+    height: 350,
+  },
+  groupPdfPreview: {
+    width: 230,
+    minHeight: 170,
+    borderRadius: 16,
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 18,
+  },
+  groupPdfTitle: {
+    color: C.ink,
+    fontSize: 14,
+    fontWeight: "900",
+    textAlign: "center",
+    marginTop: 10,
+  },
+  groupSelectedMeta: {
+    minHeight: 58,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: "#fff",
+    paddingHorizontal: 12,
+    marginTop: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  groupSelectedTitle: {
+    color: C.ink,
+    fontSize: 13.5,
+    fontWeight: "900",
+  },
+  groupSelectedSub: {
+    color: C.muted,
+    fontSize: 11.5,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  groupThumbRow: {
+    gap: 9,
+    paddingTop: 12,
+    paddingBottom: 2,
+  },
+  groupThumb: {
+    width: 58,
+    height: 70,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.bg2,
+    overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  groupThumbActive: {
+    borderColor: C.primary,
+    borderWidth: 2,
+  },
+  groupThumbImage: {
+    width: "100%",
+    height: "100%",
   },
   enterpriseRecordCard: {
     borderRadius: 18,
@@ -2806,6 +4412,13 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 12 },
     shadowRadius: 26,
     elevation: 3,
+  },
+  enterpriseRecordCardCompact: {
+    borderRadius: 14,
+    padding: 11,
+    backgroundColor: C.bg2,
+    shadowOpacity: 0,
+    elevation: 0,
   },
   recordCardTop: {
     flexDirection: "row",
@@ -3785,10 +5398,127 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     marginBottom: 8,
   },
+  insightPanelHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 2,
+  },
+  insightItem: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 9,
+    marginTop: 8,
+  },
+  insightDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    marginTop: 7,
+  },
+  insightItemText: {
+    flex: 1,
+    color: C.text,
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: "700",
+  },
+  verifiedFactItem: {
+    paddingTop: 10,
+    marginTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: C.line,
+  },
+  verifiedFactText: {
+    color: C.ink,
+    fontSize: 13.2,
+    lineHeight: 19,
+    fontWeight: "900",
+  },
+  verifiedEvidence: {
+    color: C.muted,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 3,
+    fontWeight: "700",
+  },
   ocrText: {
     color: C.text,
     fontSize: 13,
     lineHeight: 19,
+  },
+  structuredOcrText: {
+    color: C.text,
+    fontSize: 12.5,
+    lineHeight: 18,
+    fontWeight: "600",
+  },
+  reportTextWrap: {
+    gap: 12,
+  },
+  reportBlock: {
+    gap: 5,
+  },
+  reportHeading: {
+    color: C.ink,
+    fontSize: 14.5,
+    lineHeight: 20,
+    fontWeight: "900",
+    marginTop: 2,
+  },
+  reportText: {
+    color: C.text,
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: "600",
+  },
+  reportBulletRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+  },
+  reportBulletDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: C.primary,
+    marginTop: 7,
+  },
+  reportTableScroll: {
+    marginTop: 2,
+  },
+  reportTable: {
+    borderWidth: 1,
+    borderColor: C.line2,
+    borderRadius: 10,
+    overflow: "hidden",
+    minWidth: 290,
+  },
+  reportTableRow: {
+    flexDirection: "row",
+    backgroundColor: "#fff",
+    borderTopWidth: 1,
+    borderTopColor: C.line2,
+  },
+  reportTableHeaderRow: {
+    backgroundColor: C.blueSoft,
+    borderTopWidth: 0,
+  },
+  reportTableCell: {
+    minWidth: 112,
+    maxWidth: 168,
+    paddingHorizontal: 9,
+    paddingVertical: 8,
+    borderRightWidth: 1,
+    borderRightColor: C.line2,
+    color: C.text,
+    fontSize: 11.5,
+    lineHeight: 16,
+    fontWeight: "700",
+  },
+  reportTableHeaderCell: {
+    color: C.ink,
+    fontWeight: "900",
   },
   twoCol: {
     flexDirection: "row",
