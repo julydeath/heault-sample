@@ -372,7 +372,7 @@ function formatStructuredText(
     }
 
     if (!sectionLines.length) continue;
-    chunks.push(`${readableSectionTitle(section.title)}\n${sectionLines.join("\n")}`);
+    chunks.push(`## ${readableSectionTitle(section.title)}\n${sectionLines.join("\n")}`);
   }
 
   if (chunks.length) return chunks.join("\n\n");
@@ -532,9 +532,10 @@ function summarySystemPrompt() {
     "Use only the supplied verified facts and metadata.",
     "Do not diagnose. Do not add facts. Do not explain medical meaning unless the document states it.",
     "Return JSON only with keys: summary, clinicalSummary, importantFindings, tags.",
-    "summary should be 1-3 plain sentences helping the patient find this document later.",
-    "Mention category, hospital, doctor, patient, and date only when verified facts provide them.",
-    "clinicalSummary should be a concise doctor-facing note that says what document was uploaded and its verified source/date details. Do not interpret results.",
+    "summary should be 2-4 plain sentences helping the patient find this document later.",
+    "Prioritize category, hospital, doctor, patient, and date when verified facts provide them.",
+    "If tests, vaccines, medicines, or procedures are explicitly verified, mention them briefly without interpretation.",
+    "clinicalSummary should be a concise doctor-facing note based only on uploaded document data and verified source/date details. Do not interpret results.",
     "importantFindings should usually be an empty array. Include an item only when the document itself states a critical instruction, vaccine, medicine, or result and evidence is verified.",
     "tags must be short lowercase indexing tags using only verified source/type words.",
   ].join(" ");
@@ -1296,8 +1297,9 @@ function analysisSystemPrompt() {
     "Do not diagnose. Do not invent facts.",
     "Write for document retrieval, not clinical interpretation.",
     "Prefer document type, hospital, doctor, date, patient name, and category over broad findings.",
-    "Mention tests, medicines, findings, and values only when explicitly stated and necessary to identify the document.",
-    "clinicalSummary should be a clean doctor-facing note based only on source/date/type details.",
+    "Mention tests, medicines, findings, values, vaccines, and procedures only when explicitly stated and useful for identifying the document.",
+    "summary should be clear, specific, and useful for finding this record later, but must not add advice or external medical knowledge.",
+    "clinicalSummary should be a clean doctor-facing note based only on uploaded document data, source, date, and type details.",
     "importantFindings should usually be empty unless the document itself states a critical instruction, vaccine, medicine, or result.",
     "medicines should list stated medicines with dosage/frequency only when present.",
     "tests should list stated tests, scans, panels, vaccines, or procedures.",

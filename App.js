@@ -553,8 +553,10 @@ function shouldMergeGroupNames(a = "", b = "", sameBatch = false) {
 
 function findCompatibleGroup(map, group, doc) {
   if (!["hospital", "doctor", "patient"].includes(group.type)) return null;
+  if (group.transient) return null;
   for (const existing of map.values()) {
     if (existing.type !== group.type) continue;
+    if (existing.transient) continue;
     const sameBatch = Boolean(doc.batchId && existing.docs.some((item) => item.batchId === doc.batchId));
     if (sameBatch && (isWeakGroupingValue(existing.label, group.type) || isWeakGroupingValue(group.label, group.type))) return existing;
     if (shouldMergeGroupNames(existing.label, group.label, sameBatch)) return existing;
@@ -583,7 +585,26 @@ function groupLabelForMode(mode) {
   return labels[mode] || "File";
 }
 
+function pendingUploadTargetForMode(doc = {}, mode = "hospital") {
+  const target = normalizeUploadTarget(doc.uploadTarget);
+  if (!target || !isProcessingStatus(doc.status)) return null;
+  return target.type === mode ? target : null;
+}
+
 function recordGroupForDoc(doc = {}, mode = "hospital") {
+  const pendingTarget = pendingUploadTargetForMode(doc, mode);
+  if (pendingTarget) {
+    const targetKey = normalizeGroupName(pendingTarget.label) || pendingTarget.label.toLowerCase();
+    return {
+      type: pendingTarget.type,
+      label: "New uploads",
+      key: `new-uploads:${pendingTarget.type}:${targetKey}`,
+      helper: `Adding to ${pendingTarget.label}`,
+      transient: true,
+      targetLabel: pendingTarget.label,
+    };
+  }
+
   const hospital = cleanHospitalLabel(doc.hospital || "");
   const doctor = String(doc.doctor || "").trim();
   const patient = String(doc.patientName || doc.patient || "").trim();
@@ -674,6 +695,8 @@ function buildGroupingFallbacks(docs = [], mode = "hospital") {
 }
 
 function applyGroupingFallback(doc, docs, mode, fallbacks) {
+  if (pendingUploadTargetForMode(doc, mode)) return doc;
+
   const current = groupingValueForMode(doc, mode);
   if (current && !isWeakGroupingValue(current, mode)) {
     if (mode === "hospital" && current !== doc.hospital) return { ...doc, hospital: current };
@@ -843,7 +866,6 @@ function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "", u
   const now = new Date();
   const id = `doc-${now.getTime()}-${batchIndex}-${Math.random().toString(36).slice(2, 8)}`;
   const uploadTarget = normalizeUploadTarget(uploadTargetContext);
-  const targetMetadata = metadataForUploadTarget(uploadTarget);
 
   return withRecordGroup({
     id,
@@ -854,9 +876,9 @@ function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "", u
     uploadedAt: now.toISOString(),
     uploadSortDate: now.getTime(),
     batchIndex,
-    doctor: targetMetadata.doctor || "",
-    hospital: targetMetadata.hospital || "",
-    patientName: targetMetadata.patientName || "",
+    doctor: "",
+    hospital: "",
+    patientName: "",
     tags: [],
     pages: localFiles.length || 1,
     ocr: "",
@@ -1210,9 +1232,11 @@ function processingErrorMessage(error) {
   return error?.message || "Processing failed. Original file is saved. Reupload this page if the image is unclear.";
 }
 
-function processingFailurePatch(error) {
+function processingFailurePatch(error, doc = {}) {
   const message = processingErrorMessage(error);
+  const targetMetadata = metadataForUploadTarget(normalizeUploadTarget(doc.uploadTarget));
   return {
+    ...targetMetadata,
     status: "needs_reupload",
     needsReview: false,
     aiError: message,
@@ -2105,27 +2129,28 @@ function RecordGroupCard({ group, nav, mode }) {
     period: CalendarClock,
   };
   const Icon = typeIcon[group.type] || FolderOpen;
+  const isTemporary = Boolean(group.transient);
   const processing = group.docs.filter((doc) => isProcessingStatus(doc.status)).length;
   const reuploadCount = group.docs.filter((doc) => isReuploadStatus(doc.status)).length;
   const openGroup = () => nav.push("recordGroup", { groupKey: group.key, mode });
-  const groupStatus = reuploadCount ? "needs_reupload" : processing ? "processing" : "ready";
+  const groupStatus = isTemporary ? "processing" : reuploadCount ? "needs_reupload" : processing ? "processing" : "ready";
   const lastVisit = lastVisitForDocs(group.docs);
 
   return (
-    <TouchableOpacity activeOpacity={0.86} onPress={openGroup} style={styles.recordGroupCard}>
+    <TouchableOpacity activeOpacity={0.86} onPress={openGroup} style={[styles.recordGroupCard, isTemporary && styles.recordGroupCardTemporary]}>
       <View style={styles.fileFolderShadow} />
-      <View style={styles.folderTab}>
+      <View style={[styles.folderTab, isTemporary && styles.folderTabTemporary]}>
         <Icon size={14} color={C.primary} />
-        <Text style={styles.folderTabText}>{groupLabelForMode(group.type)}</Text>
+        <Text style={styles.folderTabText}>{isTemporary ? "New" : groupLabelForMode(group.type)}</Text>
       </View>
       <View style={styles.recordGroupHeader}>
-        <View style={styles.recordGroupIcon}>
+        <View style={[styles.recordGroupIcon, isTemporary && styles.recordGroupIconTemporary]}>
           <Icon size={21} color={C.primary} />
         </View>
         <View style={styles.flexFill}>
           <Text style={styles.recordGroupTitle} numberOfLines={1}>{group.label}</Text>
           <Text style={styles.recordGroupSub} numberOfLines={1}>
-            Last visit: {lastVisit}
+            {isTemporary ? group.helper : `Last visit: ${lastVisit}`}
           </Text>
         </View>
         {groupStatus === "ready" ? <ChevronRight size={19} color={C.primary} /> : <StatusPill status={groupStatus} />}
@@ -2147,11 +2172,11 @@ function RecordGroupCard({ group, nav, mode }) {
         )}
         <View style={styles.recordGroupMetric}>
           <CalendarClock size={14} color={C.primary} />
-          <Text style={styles.recordGroupMeta}>Last visit {lastVisit}</Text>
+          <Text style={styles.recordGroupMeta}>{isTemporary ? "Processing now" : `Last visit ${lastVisit}`}</Text>
         </View>
       </View>
       <View style={styles.recordGroupOpenRow}>
-        <Text style={styles.recordGroupOpenText}>Open {groupLabelForMode(group.type).toLowerCase()} file</Text>
+        <Text style={styles.recordGroupOpenText}>{isTemporary ? "View upload progress" : `Open ${groupLabelForMode(group.type).toLowerCase()} file`}</Text>
         <ChevronRight size={16} color={C.primary} />
       </View>
     </TouchableOpacity>
@@ -2515,6 +2540,11 @@ function docHasExtractedText(doc = {}) {
 
 function recordGroupIntelligence(group) {
   const docs = [...(group?.docs || [])].sort((a, b) => visitSortDate(b) - visitSortDate(a));
+  const docsByUpload = [...(group?.docs || [])].sort((a, b) => {
+    const uploadDiff = uploadSortDate(b) - uploadSortDate(a);
+    if (uploadDiff) return uploadDiff;
+    return (Number(a.batchIndex) || 0) - (Number(b.batchIndex) || 0);
+  });
   const processedDocs = docs.filter((doc) => docHasExtractedText(doc) || doc.status === "ready");
   const readyDocs = docs.filter((doc) => doc.status === "ready");
   const reuploadDocs = docs.filter((doc) => isReuploadStatus(doc.status));
@@ -2525,14 +2555,20 @@ function recordGroupIntelligence(group) {
     : undefined;
   const summaryItems = docs.map(usefulSummaryForDoc).filter(Boolean);
   const summaryText = cleanReadableText(summaryItems.map((text) => `- ${text.replace(/\n+/g, " ")}`).join("\n"));
-  const extractedText = cleanReadableText(docs
+  const extractedText = cleanReadableText(docsByUpload
     .map((doc, index) => {
       const text = structuredTextForDoc(doc);
       if (!text) return "";
+      const uploaded = displayDateLabel(doc.uploadedAt || doc.createdAt, uploadSortDate(doc));
       const visit = displayDateLabel(doc.date, visitSortDate(doc));
-      const label = [visit && visit !== "-" ? visit : "", categoryFor(doc.category).label]
+      const category = categoryFor(doc.category).label;
+      const label = [
+        uploaded && uploaded !== "-" ? `Uploaded ${uploaded}` : `Document ${index + 1}`,
+        visit && visit !== "-" && visit !== uploaded ? `Visit ${visit}` : "",
+        category,
+      ]
         .filter(Boolean)
-        .join(" - ") || `Document ${index + 1}`;
+        .join(" | ");
       return `## ${label}\n\n${text}`;
     })
     .filter(Boolean)
@@ -3268,7 +3304,7 @@ function AnalysisScreen({ nav, app, params }) {
         setStage(updated?.status === "ready" ? "Analysis complete" : "Reupload needed");
         setProgress(100);
       } catch (caught) {
-        const patch = processingFailurePatch(caught);
+        const patch = processingFailurePatch(caught, doc);
         const message = patch.aiError;
         app.updateDocPatch(doc.id, patch);
         if (active) {
@@ -3749,7 +3785,7 @@ function ReportText({ text, large = false }) {
   if (!blocks.length) return null;
 
   return (
-    <View style={styles.reportTextWrap}>
+    <View style={[styles.reportTextWrap, large && styles.reportTextWrapLarge]}>
       {blocks.map((block, blockIndex) => {
         const lines = block.split("\n").filter(Boolean);
         if (/<table/i.test(block)) {
@@ -3760,11 +3796,16 @@ function ReportText({ text, large = false }) {
         }
 
         return (
-          <View key={`block-${blockIndex}`} style={styles.reportBlock}>
+          <View key={`block-${blockIndex}`} style={[styles.reportBlock, blockIndex > 0 && styles.reportBlockSeparated]}>
             {lines.map((line, lineIndex) => {
               const heading = line.match(/^(#{1,6})\s+(.+)/);
               if (heading) {
-                return <Text key={`line-${lineIndex}`} style={[styles.reportHeading, large && styles.reportHeadingLarge]}>{heading[2]}</Text>;
+                return (
+                  <View key={`line-${lineIndex}`} style={styles.reportHeadingRow}>
+                    <View style={styles.reportHeadingAccent} />
+                    <Text style={[styles.reportHeading, large && styles.reportHeadingLarge]}>{heading[2]}</Text>
+                  </View>
+                );
               }
               const bullet = line.match(/^\s*[-*]\s+(.+)/);
               if (bullet) {
@@ -3772,6 +3813,17 @@ function ReportText({ text, large = false }) {
                   <View key={`line-${lineIndex}`} style={styles.reportBulletRow}>
                     <View style={styles.reportBulletDot} />
                     <Text style={[styles.reportText, large && styles.reportTextLarge]}>{bullet[1]}</Text>
+                  </View>
+                );
+              }
+              const numbered = line.match(/^\s*(\d+)\.\s+(.+)/);
+              if (numbered) {
+                return (
+                  <View key={`line-${lineIndex}`} style={styles.reportBulletRow}>
+                    <View style={styles.reportNumberPill}>
+                      <Text style={styles.reportNumberText}>{numbered[1]}</Text>
+                    </View>
+                    <Text style={[styles.reportText, large && styles.reportTextLarge]}>{stripInlineHtml(numbered[2])}</Text>
                   </View>
                 );
               }
@@ -4151,8 +4203,7 @@ export default function App() {
         ? localFiles.map((file, index) => createDraftDocument(method, [file], index, batchId, uploadTarget))
         : [createDraftDocument(method, localFiles, 0, batchId, uploadTarget)];
       setDocs((existing) => [...drafts, ...existing]);
-      if (uploadTarget?.groupKey) go("recordGroup", { groupKey: uploadTarget.groupKey, mode: uploadTarget.mode || uploadTarget.type });
-      else go("records");
+      go("records");
     } catch (error) {
       Alert.alert("Upload failed", error?.message || "Could not import this document.");
     }
@@ -4277,7 +4328,7 @@ export default function App() {
       processingIdsRef.current.add(doc.id);
       runDocumentPipeline(doc, app)
         .catch((error) => {
-          app.updateDocPatch(doc.id, processingFailurePatch(error));
+          app.updateDocPatch(doc.id, processingFailurePatch(error, doc));
         })
         .finally(() => {
           processingIdsRef.current.delete(doc.id);
@@ -5009,19 +5060,20 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
   },
   homeHeroGreeting: {
-    color: C.primary,
-    fontSize: 12,
-    fontWeight: "900",
-    textTransform: "uppercase",
-    marginTop: 2,
-  },
-  homeHeroTitle: {
     color: C.ink,
-    fontSize: 31,
-    lineHeight: 36,
+    fontSize: 28,
+    lineHeight: 33,
     fontWeight: "900",
     marginTop: 5,
-    maxWidth: 300,
+    maxWidth: 310,
+  },
+  homeHeroTitle: {
+    color: C.primary,
+    fontSize: 19,
+    lineHeight: 24,
+    fontWeight: "900",
+    marginTop: 4,
+    maxWidth: 310,
   },
   homeHeroText: {
     color: C.text,
@@ -5546,6 +5598,10 @@ const styles = StyleSheet.create({
     shadowRadius: 24,
     elevation: 2,
   },
+  recordGroupCardTemporary: {
+    backgroundColor: "#F8FBFF",
+    borderColor: "#C9DDF4",
+  },
   fileFolderShadow: {
     position: "absolute",
     left: 10,
@@ -5572,6 +5628,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 7,
   },
+  folderTabTemporary: {
+    backgroundColor: "#F8FBFF",
+    borderColor: "#C9DDF4",
+  },
   folderTabText: {
     color: C.primary,
     fontSize: 11,
@@ -5593,6 +5653,10 @@ const styles = StyleSheet.create({
     backgroundColor: "#F4E9ED",
     borderWidth: 1,
     borderColor: "rgba(122,23,56,0.12)",
+  },
+  recordGroupIconTemporary: {
+    backgroundColor: C.blueSoft,
+    borderColor: "rgba(40,103,178,0.16)",
   },
   recordGroupTitle: {
     color: C.ink,
@@ -7465,31 +7529,53 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   reportTextWrap: {
+    gap: 10,
+  },
+  reportTextWrapLarge: {
     gap: 12,
   },
   reportBlock: {
-    gap: 5,
+    gap: 7,
+    paddingTop: 2,
+  },
+  reportBlockSeparated: {
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: C.line,
+  },
+  reportHeadingRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    marginBottom: 1,
+  },
+  reportHeadingAccent: {
+    width: 4,
+    height: 18,
+    borderRadius: 4,
+    backgroundColor: C.primary,
+    marginTop: 2,
   },
   reportHeading: {
     color: C.ink,
-    fontSize: 14.5,
-    lineHeight: 20,
+    flex: 1,
+    fontSize: 15.2,
+    lineHeight: 21,
     fontWeight: "900",
-    marginTop: 2,
   },
   reportHeadingLarge: {
-    fontSize: 16,
-    lineHeight: 22,
+    fontSize: 16.5,
+    lineHeight: 23,
   },
   reportText: {
     color: C.text,
-    fontSize: 13,
-    lineHeight: 19,
+    fontSize: 13.3,
+    lineHeight: 20,
     fontWeight: "600",
   },
   reportTextLarge: {
-    fontSize: 13.8,
-    lineHeight: 20.5,
+    fontSize: 14,
+    lineHeight: 21,
     fontWeight: "700",
   },
   reportBulletRow: {
@@ -7504,8 +7590,23 @@ const styles = StyleSheet.create({
     backgroundColor: C.primary,
     marginTop: 7,
   },
+  reportNumberPill: {
+    minWidth: 20,
+    height: 20,
+    borderRadius: 7,
+    backgroundColor: C.blush,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 1,
+  },
+  reportNumberText: {
+    color: C.primary,
+    fontSize: 10.5,
+    fontWeight: "900",
+  },
   reportTableScroll: {
-    marginTop: 2,
+    marginTop: 4,
+    marginBottom: 2,
   },
   reportTable: {
     borderWidth: 1,
