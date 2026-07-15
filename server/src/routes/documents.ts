@@ -1246,6 +1246,44 @@ function buildOcrOnlyAnalysis({
   };
 }
 
+async function quickIndexFromOcr({
+  fileName,
+  ocrText,
+  ocrConfidence,
+}: {
+  fileName: string;
+  ocrText: string;
+  ocrConfidence?: number;
+}) {
+  const structuredOcr = await createStructuredOcr(ocrText);
+  return buildOcrOnlyAnalysis({
+    fileName,
+    ocrText,
+    structuredOcr,
+    ocrConfidence,
+    warning: "OCR indexing finished. AI summary is still processing in the background.",
+  });
+}
+
+function quickIndexPatch(quickIndex: Awaited<ReturnType<typeof quickIndexFromOcr>>) {
+  return {
+    title: quickIndex.title,
+    category: quickIndex.category,
+    hospital: quickIndex.hospital,
+    doctor: quickIndex.doctor,
+    patientName: quickIndex.patientName,
+    visitDate: quickIndex.visitDate,
+    summary: quickIndex.summary,
+    clinicalSummary: quickIndex.clinicalSummary,
+    tags: quickIndex.tags,
+    structuredOcr: quickIndex.structuredOcr,
+    verifiedFacts: quickIndex.verifiedFacts,
+    rejectedFacts: quickIndex.rejectedFacts,
+    confidence: quickIndex.confidence,
+    warnings: quickIndex.warnings,
+  };
+}
+
 async function createVerifiedSummary({
   title,
   category,
@@ -1709,6 +1747,11 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
           pageCount: azure.pageLevelText.length,
           tableCount: azure.layout.tables.length,
         });
+        const quickIndex = await quickIndexFromOcr({
+          fileName: file.originalname,
+          ocrText: azure.text,
+          ocrConfidence: azure.confidence,
+        });
         await upsertDocumentRecord(documentId, {
           ...authDocumentPatch(req),
           status: "ocr_complete",
@@ -1725,6 +1768,7 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
             tables: azure.layout.tables,
             keyValuePairs: azure.layout.keyValuePairs,
           },
+          ...quickIndexPatch(quickIndex),
           originalStorage: storedOriginal,
         });
         res.json({
@@ -1745,6 +1789,8 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
             tables: azure.layout.tables,
             keyValuePairs: azure.layout.keyValuePairs,
           },
+          quickIndex,
+          structuredOcr: quickIndex.structuredOcr,
           originalStorage: storedOriginal,
         });
         return;
@@ -1759,23 +1805,11 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         if (error instanceof AzureDocumentIntelligenceConfigurationError) {
           throw error;
         }
-        await upsertDocumentRecord(documentId, {
-          ...authDocumentPatch(req),
-          status: "retry_later",
-          fileName: file.originalname,
-          mimeType: file.mimetype,
-          ocrProvider: "azure_document_intelligence",
-          originalStorage: storedOriginal,
+        logEvent("ocr_provider_fallback", {
+          from: "azure_document_intelligence",
+          to: isImage(file.mimetype) ? "tesseract" : "pdf_parse",
+          reason: "Azure unavailable",
         });
-        res.status(azureRetryStatus(error)).json({
-          status: "retry_later",
-          code: "AZURE_OCR_UNAVAILABLE",
-          error: "Azure Document Intelligence is temporarily unavailable. Please retry in a minute.",
-          reason: "Azure Document Intelligence is temporarily unavailable. Please retry in a minute.",
-          provider: "azure_document_intelligence",
-          originalStorage: storedOriginal,
-        });
-        return;
       }
     }
 
@@ -1824,6 +1858,11 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         textLength: text.length,
         confidence: ocr.confidence,
       });
+      const quickIndex = await quickIndexFromOcr({
+        fileName: file.originalname,
+        ocrText: text,
+        ocrConfidence: ocr.confidence,
+      });
       res.json({
         status: "ok",
         provider: "tesseract",
@@ -1836,6 +1875,8 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         medicalScore: validation.medicalScore,
         minOcrConfidence: validation.minConfidence,
         pageLevelText: [{ page: 1, text, confidence: ocr.confidence }],
+        quickIndex,
+        structuredOcr: quickIndex.structuredOcr,
         originalStorage: storedOriginal,
       });
       await upsertDocumentRecord(documentId, {
@@ -1848,6 +1889,7 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         ocrConfidence: ocr.confidence,
         pageLevelText: [{ page: 1, text, confidence: ocr.confidence }],
         medicalScore: validation.medicalScore,
+        ...quickIndexPatch(quickIndex),
         originalStorage: storedOriginal,
       });
       return;
@@ -1923,6 +1965,11 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         textLength: text.length,
         confidence: 0.98,
       });
+      const quickIndex = await quickIndexFromOcr({
+        fileName: file.originalname,
+        ocrText: text,
+        ocrConfidence: 0.98,
+      });
       res.json({
         status: "ok",
         provider: "pdf_parse",
@@ -1935,6 +1982,8 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         medicalScore: validation.medicalScore,
         minOcrConfidence: validation.minConfidence,
         pageLevelText: [{ page: 1, text, confidence: 0.98 }],
+        quickIndex,
+        structuredOcr: quickIndex.structuredOcr,
         originalStorage: storedOriginal,
       });
       await upsertDocumentRecord(documentId, {
@@ -1947,6 +1996,7 @@ router.post("/ocr", requireAuth, upload.single("file"), async (req: Authenticate
         ocrConfidence: 0.98,
         pageLevelText: [{ page: 1, text, confidence: 0.98 }],
         medicalScore: validation.medicalScore,
+        ...quickIndexPatch(quickIndex),
         originalStorage: storedOriginal,
       });
       return;
@@ -2007,6 +2057,44 @@ router.post("/analyze-document", requireAuth, async (req: AuthenticatedRequest, 
       lineCount: structuredOcr.lineCount,
       warningCount: structuredOcr.warnings.length,
     });
+
+    const maxAiOcrChars = Number(process.env.OLLAMA_MAX_OCR_CHARS || 14000);
+    if (ocrText.length > maxAiOcrChars) {
+      const fallback = buildOcrOnlyAnalysis({
+        fileName,
+        ocrText,
+        structuredOcr,
+        ocrConfidence: parsedOcrConfidence,
+        warning: "This document has a lot of text, so Heault used OCR-backed indexing first. AI summary can be retried later.",
+      });
+      await upsertDocumentRecord(documentId, {
+        ...authDocumentPatch(req),
+        status: fallback.status,
+        title: fallback.title,
+        category: fallback.category,
+        hospital: fallback.hospital,
+        doctor: fallback.doctor,
+        patientName: fallback.patientName,
+        visitDate: fallback.visitDate,
+        summary: fallback.summary,
+        clinicalSummary: fallback.clinicalSummary,
+        tags: fallback.tags,
+        structuredOcr: fallback.structuredOcr,
+        verifiedFacts: fallback.verifiedFacts,
+        rejectedFacts: fallback.rejectedFacts,
+        confidence: fallback.confidence,
+        warnings: fallback.warnings,
+        needsReview: false,
+      });
+      logEvent("ai_analysis_skipped", {
+        documentId,
+        reason: "ocr_text_too_long",
+        ocrLength: ocrText.length,
+        maxAiOcrChars,
+      });
+      res.json(fallback);
+      return;
+    }
 
     const visionModel = getVisionModel();
     const visionRecommended = shouldUseVision({

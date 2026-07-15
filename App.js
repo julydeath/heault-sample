@@ -587,7 +587,7 @@ function groupLabelForMode(mode) {
 
 function pendingUploadTargetForMode(doc = {}, mode = "hospital") {
   const target = normalizeUploadTarget(doc.uploadTarget);
-  if (!target || !isProcessingStatus(doc.status)) return null;
+  if (!target || !["queued", "processing"].includes(doc.status)) return null;
   return target.type === mode ? target : null;
 }
 
@@ -1070,6 +1070,26 @@ function textFromOcrResponse(ocr) {
   return cleanReadableText(ocr?.ocrText || ocr?.cleanedOcrText || ocr?.rawOcrText || "");
 }
 
+function quickIndexPatchFromOcrResponse(ocr = {}) {
+  const quick = ocr.quickIndex && typeof ocr.quickIndex === "object" ? ocr.quickIndex : {};
+  const patch = {};
+  if (quick.title) patch.title = quick.title;
+  if (isKnownCategory(quick.category)) patch.category = quick.category;
+  if (quick.hospital) patch.hospital = quick.hospital;
+  if (quick.doctor) patch.doctor = quick.doctor;
+  if (quick.patientName) patch.patientName = quick.patientName;
+  if (quick.visitDate) patch.date = quick.visitDate;
+  if (Array.isArray(quick.tags)) patch.tags = quick.tags.filter(Boolean).slice(0, 8);
+  if (quick.summary) patch.summary = quick.summary;
+  if (quick.clinicalSummary) patch.clinicalSummary = quick.clinicalSummary;
+  if (quick.structuredOcr || ocr.structuredOcr) patch.structuredOcr = quick.structuredOcr || ocr.structuredOcr;
+  if (Array.isArray(quick.verifiedFacts)) patch.verifiedFacts = quick.verifiedFacts;
+  if (Array.isArray(quick.rejectedFacts)) patch.rejectedFacts = quick.rejectedFacts;
+  if (typeof quick.confidence === "number") patch.confidence = quick.confidence;
+  if (Array.isArray(quick.warnings)) patch.warnings = quick.warnings;
+  return patch;
+}
+
 async function runDocumentPipeline(doc, app, callbacks = {}) {
   const isActive = callbacks.isActive || (() => true);
   const setStage = callbacks.setStage || (() => undefined);
@@ -1106,6 +1126,7 @@ async function runDocumentPipeline(doc, app, callbacks = {}) {
       provider: ocr.provider,
       confidence: ocr.ocrConfidence,
       originalStorage: ocr.originalStorage,
+      quickIndexSource: ocr,
     });
 
     pageTexts.push(...returnedPages.map((page, pageIndex) => ({
@@ -1129,15 +1150,17 @@ async function runDocumentPipeline(doc, app, callbacks = {}) {
     : undefined;
   const ocrProvider = fileTexts.find((file) => file.provider)?.provider;
   const originalStorage = fileTexts.find((file) => file.originalStorage)?.originalStorage || doc.originalStorage;
+  const quickIndexPatch = fileTexts.length === 1 ? quickIndexPatchFromOcrResponse(fileTexts[0].quickIndexSource) : {};
 
   app.updateDocPatch(doc.id, {
+    ...quickIndexPatch,
     ocr: combinedText,
     pageLevelText: pageTexts,
     ocrConfidence,
     ocrProvider,
     originalStorage,
     status: "ocr_complete",
-    summary: "OCR complete. AI summary and grouping are running in the background.",
+    summary: quickIndexPatch.summary || "OCR complete. AI summary and grouping are running in the background.",
   });
 
   if (!isActive()) return null;
