@@ -16,7 +16,7 @@ import {
   AzureDocumentIntelligenceConfigurationError,
   isAzureDocumentIntelligenceConfigured,
 } from "../services/azureDocumentIntelligenceClient";
-import { saveOriginalFile } from "../services/storage";
+import { readStoredOriginal, saveOriginalFile, StoredOriginal } from "../services/storage";
 import { validateOcrForUpload } from "../services/documentValidation";
 import { getCollection } from "../services/database";
 import { AuthenticatedRequest, requireAuth } from "./auth";
@@ -70,19 +70,32 @@ async function upsertDocumentRecord(documentId: string | undefined, patch: Recor
   const documents = await getCollection("documents");
   if (!documents) return;
   await ensureDocumentIndexes();
+  const originalStorage = patch.originalStorage;
+  const hasOriginalStorage = Boolean(
+    originalStorage
+    && typeof originalStorage === "object"
+    && "storageKey" in (originalStorage as Record<string, unknown>)
+  );
+  const update: Record<string, unknown> = {
+    $set: {
+      ...patch,
+      updatedAt: new Date(),
+    },
+    $setOnInsert: {
+      documentId,
+      createdAt: new Date(),
+      uploadedAt: new Date(),
+    },
+  };
+  if (hasOriginalStorage) {
+    update.$addToSet = {
+      originalFiles: originalStorage,
+    };
+  }
 
   await documents.updateOne(
     { documentId },
-    {
-      $set: {
-        ...patch,
-        updatedAt: new Date(),
-      },
-      $setOnInsert: {
-        documentId,
-        createdAt: new Date(),
-      },
-    },
+    update,
     { upsert: true }
   ).catch((error) => {
     logEvent("document_record_save_failed", {
@@ -116,6 +129,9 @@ function appDocumentFromRecord(record: Record<string, unknown>) {
     title: record.title || record.fileName || "Medical document",
     category: record.category || "others",
     date: record.visitDate || record.date || record.updatedAt || record.createdAt,
+    uploadedAt: record.uploadedAt || record.createdAt || record.updatedAt,
+    updatedAt: record.updatedAt,
+    createdAt: record.createdAt,
     sortDate: record.updatedAt ? new Date(record.updatedAt as string).getTime() : Date.now(),
     doctor: record.doctor || "",
     hospital: record.hospital || "",
@@ -138,19 +154,23 @@ function appDocumentFromRecord(record: Record<string, unknown>) {
     verifiedFacts: Array.isArray(record.verifiedFacts) ? record.verifiedFacts : [],
     rejectedFacts: Array.isArray(record.rejectedFacts) ? record.rejectedFacts : [],
     originalStorage: record.originalStorage || null,
+    originalFiles: Array.isArray(record.originalFiles) ? record.originalFiles : [],
     fileName: record.fileName || "",
     mimeType: record.mimeType || "",
     batchId: record.batchId || "",
+    batchIndex: typeof record.batchIndex === "number" ? record.batchIndex : 0,
     originalSaved: true,
   };
 }
 
 function authDocumentPatch(req: AuthenticatedRequest) {
   const batchId = typeof req.body?.batchId === "string" ? req.body.batchId.trim().slice(0, 120) : "";
+  const batchIndex = Number(req.body?.batchIndex);
   return {
     userId: req.auth?.userId,
     phoneE164: req.auth?.phoneE164,
     ...(batchId ? { batchId } : {}),
+    ...(Number.isFinite(batchIndex) ? { batchIndex } : {}),
   };
 }
 
@@ -525,10 +545,12 @@ function factFromField(type: string, label: string, value: unknown): ExtractionF
   const fieldValue = typeof field.value === "string" ? field.value.trim() : "";
   const evidence = typeof field.evidence === "string" ? field.evidence.trim() : "";
   if (!fieldValue || !evidence) return null;
+  const normalizedValue = type === "hospital" ? cleanHospitalCandidate(fieldValue) : fieldValue;
+  if (type === "hospital" && !isLikelyHospitalName(normalizedValue) && !hasExplicitHospitalLabel(label) && !hasExplicitHospitalLabel(evidence)) return null;
   return {
     type,
     label,
-    value: fieldValue,
+    value: normalizedValue,
     evidence,
     confidence: typeof field.confidence === "number" ? Math.max(0, Math.min(1, field.confidence)) : 0.5,
   };
@@ -541,7 +563,8 @@ function normalizeFact(value: unknown, fallbackType = "fact"): ExtractionFact | 
     : typeof item.name === "string" && item.name.trim()
       ? item.name.trim().slice(0, 100)
       : fallbackType;
-  const factValue = typeof item.value === "string" && item.value.trim()
+  const inferredType = typeof item.type === "string" && item.type.trim() ? item.type.trim().slice(0, 60) : fallbackType;
+  const rawFactValue = typeof item.value === "string" && item.value.trim()
     ? item.value.trim().slice(0, 180)
     : [
       typeof item.name === "string" ? item.name.trim() : "",
@@ -550,10 +573,12 @@ function normalizeFact(value: unknown, fallbackType = "fact"): ExtractionFact | 
       typeof item.date === "string" ? item.date.trim() : "",
     ].filter(Boolean).join(" ").slice(0, 180);
   const evidence = typeof item.evidence === "string" ? item.evidence.trim().slice(0, 260) : "";
+  const factValue = inferredType === "hospital" ? cleanHospitalCandidate(rawFactValue) : rawFactValue;
   if (!factValue || !evidence) return null;
+  if (inferredType === "hospital" && !isLikelyHospitalName(factValue) && !hasExplicitHospitalLabel(label) && !hasExplicitHospitalLabel(evidence)) return null;
 
   return {
-    type: typeof item.type === "string" && item.type.trim() ? item.type.trim().slice(0, 60) : fallbackType,
+    type: inferredType,
     label,
     value: factValue,
     unit: typeof item.unit === "string" ? item.unit.trim().slice(0, 40) : undefined,
@@ -600,7 +625,8 @@ function inferFactTypeFromLine(line: string) {
   if (/\b(date|dated|collected|reported|visit)\b|(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i.test(line)) return "date";
   if (/\b(dr\.?|doctor|consultant|physician)\b/i.test(line)) return "doctor";
   if (/\b(patient|name|age|sex|gender|dob|uhid|mrn)\b/i.test(line)) return "patient";
-  if (/\b(hospital|clinic|labs?|laborator(?:y|ies)|diagnostics?|medical|healthcare|care)\b/i.test(line)) return "hospital";
+  if (hasExplicitHospitalLabel(line)) return "hospital";
+  if (isLikelyHospitalName(line)) return "hospital";
   if (/\b(rx|tablet|capsule|syrup|injection|ointment|drops|mg|mcg|ml|dose|daily|twice)\b/i.test(line)) return "medicine";
   if (hasTableLikeContent(line) || /\b(test|result|unit|range|hemoglobin|wbc|rbc|platelet|glucose|creatinine|tsh|hba1c)\b/i.test(line)) return "test";
   if (/\b(impression|conclusion|finding|advice|recommendation|follow up|diagnosis)\b/i.test(line)) return "finding";
@@ -650,10 +676,12 @@ function fallbackFactsFromStructuredOcr(structuredOcr: StructuredOcr, ocrConfide
     const label = cleanOcrLineText(pair.label);
     const value = cleanOcrLineText(pair.value);
     if (!label || !value || !evidence) continue;
+    const type = inferFactTypeFromLine(`${label} ${value}`);
+    if (type === "hospital" && !isLikelyHospitalName(value) && !hasExplicitHospitalLabel(label) && !hasExplicitHospitalLabel(evidence)) continue;
     facts.push({
-      type: inferFactTypeFromLine(`${label} ${value}`),
+      type,
       label: label.slice(0, 100),
-      value: value.slice(0, 180),
+      value: type === "hospital" ? cleanHospitalCandidate(value).slice(0, 180) : value.slice(0, 180),
       evidence: evidence.slice(0, 260),
       confidence,
     });
@@ -668,10 +696,12 @@ function fallbackFactsFromStructuredOcr(structuredOcr: StructuredOcr, ocrConfide
 
   for (const line of fallbackLines.slice(0, 18)) {
     const { label, value } = labelAndValueFromOcrLine(line);
+    const type = inferFactTypeFromLine(line);
+    if (type === "hospital" && !isLikelyHospitalName(value) && !hasExplicitHospitalLabel(label) && !hasExplicitHospitalLabel(line)) continue;
     facts.push({
-      type: inferFactTypeFromLine(line),
+      type,
       label,
-      value,
+      value: type === "hospital" ? cleanHospitalCandidate(value) : value,
       evidence: line.slice(0, 260),
       confidence,
     });
@@ -981,6 +1011,95 @@ function factValueByType(facts: ExtractionFact[], type: string) {
   return facts.find((fact) => fact.verified && fact.type === type)?.value || "";
 }
 
+const HOSPITAL_FACILITY_RE = /\b(hospital|clinic|medical\s+(centre|center|college)?|health\s*care|healthcare|diagnostics?|labs?|laborator(?:y|ies)|pathology|imaging|radiology|nursing\s+home|dental|eye\s+care|care\s+(centre|center))\b/i;
+const HOSPITAL_REJECT_RE = /^#|\b(laboratory\s+test\s+reports?|lab\s+reports?|test\s+reports?|medical\s+reports?|reports?|prescription|invoice|receipt|bill|patient|uhid|mrn|age|sex|gender|dob|sample|specimen|collection|collected|received|reported|printed|result|unit|range|reference|doctor|dr\.?|consultant|department|investigation)\b/i;
+const ADDRESS_WORD_RE = /\b(road|rd\.?|street|st\.?|nagar|colony|layout|sector|phase|near|opp\.?|opposite|floor|building|complex|city|district|state|pin|pincode|phone|mobile|email|www)\b/i;
+const EXPLICIT_HOSPITAL_LABEL_RE = /^\s*(hospital|clinic|facility|diagnostics)(\s+name)?\s*[:\-]?\s*$/i;
+
+function hasExplicitHospitalLabel(value: string) {
+  const clean = cleanReadableLine(value);
+  if (EXPLICIT_HOSPITAL_LABEL_RE.test(clean)) return true;
+  return /^\s*(hospital|clinic|facility|diagnostics)(\s+name)?\s*[:\-]/i.test(clean);
+}
+
+function cleanHospitalCandidate(value: string) {
+  const text = cleanReadableLine(value)
+    .replace(/^\s*#+\s*/, "")
+    .replace(/^\s*(hospital|clinic|lab|laboratory|diagnostics|facility|name)\s*[:\-]\s*/i, "")
+    .replace(/\b(laboratory\s+test\s+reports?|lab\s+reports?|test\s+reports?|medical\s+reports?|reports?|prescription|invoice|receipt|bill)\b.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const firstComma = text.split(",")[0]?.trim();
+  if (firstComma && HOSPITAL_FACILITY_RE.test(firstComma)) return firstComma;
+  return text;
+}
+
+function hospitalCandidateScore(value: string, lineIndex = 99) {
+  const label = cleanHospitalCandidate(value);
+  if (!label || label.length < 3 || label.length > 90) return 0;
+  if (HOSPITAL_REJECT_RE.test(label)) return 0;
+  if (/^\d+[\d\s,./-]*$/.test(label)) return 0;
+
+  const words = label.split(/\s+/).filter(Boolean);
+  const hasFacility = HOSPITAL_FACILITY_RE.test(label);
+  if (!hasFacility && (words.length < 2 || ADDRESS_WORD_RE.test(label))) return 0;
+
+  let score = hasFacility ? 8 : 3;
+  if (lineIndex < 8) score += 2;
+  else if (lineIndex < 20) score += 1;
+  if (/^[A-Z0-9 .,&'()-]+$/.test(label) || /\b[A-Z][a-z]{2,}\b/.test(label)) score += 1;
+  if (ADDRESS_WORD_RE.test(label)) score -= hasFacility ? 2 : 5;
+  if ((label.match(/\d/g) || []).length > 6) score -= 2;
+  if ((label.match(/,/g) || []).length > 1) score -= 1;
+  if (words.length > 8) score -= 1;
+  return Math.max(0, score);
+}
+
+function isLikelyHospitalName(value: string) {
+  return hospitalCandidateScore(value) >= 5;
+}
+
+function hospitalSegmentsFromLine(value: string) {
+  const clean = cleanReadableLine(value);
+  const parts = clean
+    .split(/\s{2,}|\t|\||•/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return [...new Set([clean, ...parts])];
+}
+
+function inferHospitalFromOcr(structuredOcr: StructuredOcr) {
+  const candidates = getOcrLines(structuredOcr.rawText)
+    .slice(0, 60)
+    .flatMap((line, index) => hospitalSegmentsFromLine(line.text).map((value) => ({
+      value: cleanHospitalCandidate(value),
+      score: hospitalCandidateScore(value, index),
+    })))
+    .filter((candidate) => candidate.value && candidate.score > 0)
+    .sort((a, b) => b.score - a.score || a.value.length - b.value.length);
+
+  return candidates[0]?.value || "";
+}
+
+function bestHospitalName(verifiedFacts: ExtractionFact[], structuredOcr: StructuredOcr) {
+  const factCandidates = verifiedFacts
+    .filter((fact) => fact.verified && fact.type === "hospital")
+    .map((fact) => ({
+      value: cleanHospitalCandidate(fact.value),
+      score: hospitalCandidateScore(fact.value, 12) + 1,
+    }));
+  const ocrCandidate = inferHospitalFromOcr(structuredOcr);
+  const candidates = [
+    ...factCandidates,
+    ...(ocrCandidate ? [{ value: ocrCandidate, score: hospitalCandidateScore(ocrCandidate, 0) }] : []),
+  ]
+    .filter((candidate) => candidate.value && candidate.score > 0)
+    .sort((a, b) => b.score - a.score || a.value.length - b.value.length);
+
+  return candidates[0]?.value || "";
+}
+
 function firstMeaningfulOcrLine(structuredOcr: StructuredOcr) {
   return getOcrLines(structuredOcr.rawText)
     .map((line) => line.text.trim())
@@ -1033,7 +1152,7 @@ function documentTitleForVault({
   category: string;
   verifiedFacts: ExtractionFact[];
 }) {
-  const hospital = factValueByType(verifiedFacts, "hospital") || inferHospitalFromOcr(structuredOcr);
+  const hospital = bestHospitalName(verifiedFacts, structuredOcr);
   const doctor = factValueByType(verifiedFacts, "doctor");
   const date = factValueByType(verifiedFacts, "date");
   const typeLabel = categoryTitleLabel(category);
@@ -1044,15 +1163,9 @@ function documentTitleForVault({
   return documentTitleFromExtraction(extraction, structuredOcr, fileName);
 }
 
-function inferHospitalFromOcr(structuredOcr: StructuredOcr) {
-  return getOcrLines(structuredOcr.rawText)
-    .map((line) => line.text.trim())
-    .find((line) => /\b(hospital|clinic|labs?|diagnostics?|medical|healthcare|care)\b/i.test(line)) || "";
-}
-
 function buildFallbackSummary(title: string, category: string, verifiedFacts: ExtractionFact[]) {
   const categoryLabel = category.replace(/_/g, " ");
-  const hospital = factValueByType(verifiedFacts, "hospital");
+  const hospital = cleanHospitalCandidate(factValueByType(verifiedFacts, "hospital"));
   const doctor = factValueByType(verifiedFacts, "doctor");
   const date = factValueByType(verifiedFacts, "date");
   const patient = factValueByType(verifiedFacts, "patient");
@@ -1064,6 +1177,72 @@ function buildFallbackSummary(title: string, category: string, verifiedFacts: Ex
   const lead = `${title || "This document"} is saved as ${categoryLabel}${sourceParts.length ? ` ${sourceParts.join(", ")}` : ""}.`;
   const patientLine = patient ? `Patient name found: ${patient}.` : "";
   return [lead, patientLine || "Open the original document for full clinical details."].filter(Boolean).join(" ");
+}
+
+function buildOcrOnlyAnalysis({
+  fileName,
+  ocrText,
+  structuredOcr,
+  ocrConfidence,
+  warning,
+}: {
+  fileName: string;
+  ocrText: string;
+  structuredOcr: StructuredOcr;
+  ocrConfidence?: number;
+  warning: string;
+}) {
+  const category = inferCategoryFromOcrText(ocrText);
+  const fallbackFacts = fallbackFactsFromStructuredOcr(structuredOcr, ocrConfidence);
+  const factsWithStatus = dedupeFacts(applyVerification(
+    fallbackFacts,
+    codeVerifyFacts(fallbackFacts, ocrText),
+    ocrText
+  ));
+  const verifiedFacts = factsWithStatus.filter((fact) => fact.verified);
+  const title = documentTitleForVault({
+    extraction: { primaryCategory: category },
+    structuredOcr,
+    fileName,
+    category,
+    verifiedFacts,
+  });
+  const summary = buildFallbackSummary(title, category, verifiedFacts);
+
+  return {
+    status: "ready",
+    title,
+    category,
+    summary,
+    clinicalSummary: summary,
+    importantFindings: [],
+    medicines: verifiedFacts
+      .filter((fact) => fact.type === "medicine")
+      .map((fact) => `${fact.label}: ${fact.value}`)
+      .slice(0, 10),
+    tests: verifiedFacts
+      .filter((fact) => fact.type === "test")
+      .map((fact) => `${fact.label}: ${fact.value}${fact.unit ? ` ${fact.unit}` : ""}${fact.referenceRange ? ` (${fact.referenceRange})` : ""}`)
+      .slice(0, 10),
+    hospital: bestHospitalName(verifiedFacts, structuredOcr),
+    doctor: factValueByType(verifiedFacts, "doctor"),
+    patientName: factValueByType(verifiedFacts, "patient"),
+    visitDate: factValueByType(verifiedFacts, "date"),
+    tags: [category],
+    confidence: Math.max(0, Math.min(1, ocrConfidence || 0.65)),
+    needsReview: false,
+    needsReupload: false,
+    warnings: [warning, "OCR text and original file were saved. AI summary can be retried later."],
+    structuredOcr,
+    ocrConfidence,
+    extractionMode: "ocr_text",
+    verifiedFacts,
+    rejectedFacts: factsWithStatus.filter((fact) => !fact.verified),
+    verification: {
+      status: "ocr_only",
+      requiresHumanReview: false,
+    },
+  };
 }
 
 async function createVerifiedSummary({
@@ -1265,7 +1444,7 @@ function normalizeHybridDocumentAnalysis({
       .filter((fact) => fact.type === "test")
       .map((fact) => `${fact.label}: ${fact.value}${fact.unit ? ` ${fact.unit}` : ""}${fact.referenceRange ? ` (${fact.referenceRange})` : ""}`)
       .slice(0, 10),
-    hospital: factValueByType(verifiedFacts, "hospital") || inferHospitalFromOcr(structuredOcr),
+    hospital: bestHospitalName(verifiedFacts, structuredOcr),
     doctor: factValueByType(verifiedFacts, "doctor"),
     patientName: factValueByType(verifiedFacts, "patient"),
     visitDate: factValueByType(verifiedFacts, "date"),
@@ -1362,6 +1541,58 @@ router.get("/documents", requireAuth, async (req: AuthenticatedRequest, res) => 
     .limit(500)
     .toArray();
   res.json({ documents: records.map((record) => appDocumentFromRecord(record as Record<string, unknown>)) });
+});
+
+router.get("/documents/:documentId/originals/:index", requireAuth, async (req: AuthenticatedRequest, res) => {
+  const documents = await getCollection("documents");
+  if (!documents) {
+    res.status(404).json({ error: "Document storage is not available." });
+    return;
+  }
+
+  const record = await documents.findOne({
+    documentId: req.params.documentId,
+    userId: req.auth?.userId,
+    deletedAt: { $exists: false },
+  });
+
+  if (!record) {
+    res.status(404).json({ error: "Document not found." });
+    return;
+  }
+
+  const originals = Array.isArray(record.originalFiles) && record.originalFiles.length
+    ? record.originalFiles
+    : record.originalStorage
+      ? [record.originalStorage]
+      : [];
+  const index = Number.parseInt(String(req.params.index), 10);
+  const original = originals[index] as StoredOriginal | undefined;
+
+  if (!original) {
+    res.status(404).json({ error: "Original file not found." });
+    return;
+  }
+
+  try {
+    const readable = await readStoredOriginal(original);
+    res.setHeader("Content-Type", readable.mimeType);
+    if (readable.size) res.setHeader("Content-Length", String(readable.size));
+    res.setHeader("Content-Disposition", `inline; filename="${String(readable.fileName).replace(/"/g, "")}"`);
+    readable.stream.on("error", () => {
+      if (!res.headersSent) res.status(500).json({ error: "Could not read original file." });
+      else res.end();
+    });
+    readable.stream.pipe(res);
+  } catch (error) {
+    logEvent("original_stream_failed", {
+      documentId: req.params.documentId,
+      index,
+      provider: original.provider,
+      error: error instanceof Error ? error.message : "Could not stream original file.",
+    });
+    res.status(404).json({ error: "Original file could not be opened." });
+  }
 });
 
 router.patch("/documents/:documentId", requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -1890,6 +2121,42 @@ router.post("/analyze-document", requireAuth, async (req: AuthenticatedRequest, 
       durationMs: Date.now() - startedAt,
       error: error instanceof Error ? error.message : "Unknown AI error",
     });
+    if (structuredOcr) {
+      const fallback = buildOcrOnlyAnalysis({
+        fileName,
+        ocrText,
+        structuredOcr,
+        ocrConfidence: parsedOcrConfidence,
+        warning: error instanceof OllamaUnavailableError
+          ? "Ollama Cloud is temporarily unreachable."
+          : error instanceof OllamaInvalidJsonError
+            ? "AI returned an invalid response."
+            : error instanceof OllamaConfigurationError
+              ? "AI configuration is incomplete."
+              : "AI analysis failed.",
+      });
+      await upsertDocumentRecord(documentId, {
+        ...authDocumentPatch(req),
+        status: fallback.status,
+        title: fallback.title,
+        category: fallback.category,
+        hospital: fallback.hospital,
+        doctor: fallback.doctor,
+        patientName: fallback.patientName,
+        visitDate: fallback.visitDate,
+        summary: fallback.summary,
+        clinicalSummary: fallback.clinicalSummary,
+        tags: fallback.tags,
+        structuredOcr: fallback.structuredOcr,
+        verifiedFacts: fallback.verifiedFacts,
+        rejectedFacts: fallback.rejectedFacts,
+        confidence: fallback.confidence,
+        warnings: fallback.warnings,
+        needsReview: false,
+      });
+      res.json(fallback);
+      return;
+    }
     const mapped = mapAiError(error);
     await upsertDocumentRecord(documentId, {
       ...authDocumentPatch(req),

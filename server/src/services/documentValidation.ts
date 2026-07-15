@@ -23,8 +23,13 @@ const MEDICAL_PATTERNS = [
 ];
 
 export function minOcrConfidence() {
-  const value = Number(process.env.MIN_OCR_CONFIDENCE || 0.95);
-  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.95;
+  const value = Number(process.env.MIN_OCR_CONFIDENCE || 0.85);
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.85;
+}
+
+function conditionalOcrConfidence() {
+  const value = Number(process.env.CONDITIONAL_OCR_CONFIDENCE || 0.75);
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.75;
 }
 
 export function medicalDocumentScore(text: string) {
@@ -39,6 +44,7 @@ export function medicalDocumentScore(text: string) {
 
 export function validateOcrForUpload({ text, confidence, provider }: OcrValidationInput): OcrValidationResult {
   const minConfidence = minOcrConfidence();
+  const conditionalConfidence = Math.min(minConfidence, conditionalOcrConfidence());
   const parsedConfidence = Number(confidence);
   const usableConfidence = Number.isFinite(parsedConfidence) ? parsedConfidence : 0;
   const medicalScore = medicalDocumentScore(text);
@@ -54,22 +60,33 @@ export function validateOcrForUpload({ text, confidence, provider }: OcrValidati
     };
   }
 
-  if (usableConfidence < minConfidence) {
+  if (medicalScore < 2) {
     return {
       ok: false,
-      code: "LOW_OCR_CONFIDENCE",
-      reason: `OCR confidence is below ${Math.round(minConfidence * 100)}%. Please retake or reupload a clearer medical document.`,
+      code: "NOT_MEDICAL_DOCUMENT",
+      reason: "This does not look like a medical document. Please upload a hospital, doctor, lab, scan, prescription, certificate, or vaccination record.",
       httpStatus: 422,
       medicalScore,
       minConfidence,
     };
   }
 
-  if (medicalScore < 2) {
+  if (usableConfidence < conditionalConfidence) {
     return {
       ok: false,
-      code: "NOT_MEDICAL_DOCUMENT",
-      reason: "This does not look like a medical document. Please upload a hospital, doctor, lab, scan, prescription, certificate, or vaccination record.",
+      code: "LOW_OCR_CONFIDENCE",
+      reason: `OCR confidence is below ${Math.round(conditionalConfidence * 100)}%. Please retake or reupload a clearer medical document.`,
+      httpStatus: 422,
+      medicalScore,
+      minConfidence,
+    };
+  }
+
+  if (usableConfidence < minConfidence && medicalScore < 4) {
+    return {
+      ok: false,
+      code: "LOW_OCR_CONFIDENCE",
+      reason: `OCR confidence is below ${Math.round(minConfidence * 100)}% and the medical details are not clear enough. Please retake or reupload this document.`,
       httpStatus: 422,
       medicalScore,
       minConfidence,

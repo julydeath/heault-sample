@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: heault-api
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MIN_OCR_CONFIDENCE
+        value: "0.95"
+      - key: OLLAMA_BASE_URL
+        value: https://ollama.com
+      - key: AZURE_DOCUMENT_INTELLIGENCE_API_VERSION
+        value: "2024-11-30"
+      - key: AZURE_STORAGE_CONTAINER
+        value: heault-originals

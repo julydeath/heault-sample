@@ -3,9 +3,12 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
   Easing,
+  FlatList,
   Image,
   Modal,
+  PanResponder,
   Platform,
   SafeAreaView,
   ScrollView,
@@ -22,6 +25,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
+import Pdf from "react-native-pdf";
 import {
   BadgeCheck,
   BatteryFull,
@@ -79,35 +83,42 @@ import {
   ZoomOut,
 } from "lucide-react-native";
 
+const DEVICE_WIDTH = Dimensions.get("window").width;
+const DEVICE_HEIGHT = Dimensions.get("window").height;
+
 const C = {
-  bg: "#F7F8FA",
-  bg2: "#FBFCFD",
+  bg: "#F5F7FA",
+  bg2: "#EEF2F6",
   surface: "#FFFFFF",
-  surface2: "#F2F4F7",
-  cream: "#F8F3EA",
-  blush: "#F7E8EE",
-  blushStrong: "#FA8DB1",
-  primary: "#741636",
-  primary2: "#9B3C5A",
-  primary3: "#C76886",
-  ink: "#24121B",
-  text: "#44303A",
-  muted: "#8F737D",
-  line: "#F1DAE1",
-  line2: "#EADFE0",
-  green: "#5DA977",
-  greenSoft: "#E8F8EC",
-  blue: "#4E7DD9",
-  blueSoft: "#EDF4FF",
-  amber: "#B96B32",
-  amberSoft: "#FFF1DF",
-  red: "#C24654",
-  redSoft: "#FFE8EC",
+  surface2: "#F8FAFC",
+  cream: "#F7F3EA",
+  blush: "#F5E8ED",
+  blushStrong: "#E981A2",
+  primary: "#7A1738",
+  primary2: "#9B3152",
+  primary3: "#C05D7E",
+  ink: "#17202A",
+  text: "#374151",
+  muted: "#71808F",
+  line: "#E3E8EF",
+  line2: "#D7DEE8",
+  green: "#2F8F5B",
+  greenSoft: "#EAF7F0",
+  blue: "#2867B2",
+  blueSoft: "#EAF2FF",
+  teal: "#0E7C86",
+  tealSoft: "#E6F5F6",
+  amber: "#A65F16",
+  amberSoft: "#FFF4E4",
+  red: "#B4233C",
+  redSoft: "#FDE8ED",
 };
 
-const MAX_ANALYSIS_IMAGE_COUNT = 3;
+const MAX_ANALYSIS_IMAGE_COUNT = 0;
 const MAX_ANALYSIS_IMAGE_BYTES = 4 * 1024 * 1024;
 const MAX_ANALYSIS_IMAGE_CHARS = 12_000_000;
+const EXTRACTED_TEXT_PREVIEW_LIMIT = 2600;
+const PROCESSING_CONCURRENCY = 1;
 
 function normalizeApiBaseUrl(value) {
   const fallback = Platform.OS === "android" ? "http://127.0.0.1:4000" : "http://localhost:4000";
@@ -239,19 +250,19 @@ const initialUser = {
 const CATEGORIES = [
   { id: "prescriptions", label: "Prescriptions", icon: FileText, tint: C.blush, color: C.primary },
   { id: "reports", label: "Reports", icon: FileCheck2, tint: C.blueSoft, color: C.blue },
-  { id: "scans", label: "Scans", icon: ScanLine, tint: C.amberSoft, color: C.amber },
+  { id: "scans", label: "Scans", icon: ScanLine, tint: C.tealSoft, color: C.teal },
   { id: "certificates", label: "Certificates", icon: BadgeCheck, tint: C.greenSoft, color: C.green },
-  { id: "vaccinations", label: "Vaccinations", icon: Syringe, tint: "#F3EAFE", color: "#7E4CC2" },
-  { id: "others", label: "Others", icon: FolderOpen, tint: "#F3ECEE", color: C.text },
+  { id: "vaccinations", label: "Vaccinations", icon: Syringe, tint: "#EEF0FF", color: "#5E55B9" },
+  { id: "others", label: "Others", icon: FolderOpen, tint: "#EEF2F6", color: C.text },
 ];
 
 const RECORD_CARD_GRADS = {
-  prescriptions: ["#FF7CA5", "#7A123A"],
-  reports: ["#3D82FF", "#071846"],
-  scans: ["#E8A15A", "#6D281F"],
-  certificates: ["#79D994", "#1F5532"],
-  vaccinations: ["#8BD84D", "#18380F"],
-  others: ["#B48B7F", "#321B21"],
+  prescriptions: ["#9B3152", "#5E102B"],
+  reports: ["#2867B2", "#102C54"],
+  scans: ["#0E7C86", "#0B4650"],
+  certificates: ["#2F8F5B", "#174B32"],
+  vaccinations: ["#5E55B9", "#2D2869"],
+  others: ["#64748B", "#1F2937"],
 };
 
 const DECK_CARD_HEIGHT = 248;
@@ -350,6 +361,50 @@ function formatDate(value = new Date()) {
   return `${value.getDate()} ${months[value.getMonth()]} ${value.getFullYear()}`;
 }
 
+function parseDateLike(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const cleaned = text.replace(/(\d+)(st|nd|rd|th)\b/gi, "$1");
+  const parsed = new Date(cleaned);
+  if (!Number.isNaN(parsed.getTime())) return parsed.getTime();
+  const iso = cleaned.match(/\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/);
+  if (iso) {
+    const date = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+    return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+  }
+  const dmy = cleaned.match(/\b(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b/);
+  if (dmy) {
+    const year = Number(dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3]);
+    const date = new Date(year, Number(dmy[2]) - 1, Number(dmy[1]));
+    return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+  }
+  return 0;
+}
+
+function visitSortDate(doc = {}) {
+  return parseDateLike(doc.date) || Number(doc.sortDate) || 0;
+}
+
+function uploadSortDate(doc = {}) {
+  return parseDateLike(doc.uploadedAt || doc.createdAt)
+    || Number(doc.uploadSortDate)
+    || Number(doc.sortDate)
+    || 0;
+}
+
+function displayDateLabel(value, fallbackSortDate = 0) {
+  const parsed = parseDateLike(value) || Number(fallbackSortDate) || 0;
+  if (parsed) return formatDate(new Date(parsed));
+  return String(value || "").trim() || "-";
+}
+
+function lastVisitForDocs(docs = []) {
+  const sorted = [...docs].sort((a, b) => visitSortDate(b) - visitSortDate(a));
+  const doc = sorted[0];
+  if (!doc) return "-";
+  return displayDateLabel(doc.date, visitSortDate(doc));
+}
+
 function safeFileName(name = "medical-document") {
   return name.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").slice(0, 90) || "medical-document";
 }
@@ -376,6 +431,10 @@ function inferMimeType(asset) {
   if (ext === "png") return "image/png";
   if (ext === "webp") return "image/webp";
   return "image/jpeg";
+}
+
+function isPdfMime(mimeType = "", name = "") {
+  return mimeType === "application/pdf" || String(name || "").toLowerCase().endsWith(".pdf");
 }
 
 function statusCopy(status) {
@@ -417,6 +476,61 @@ function normalizedTokens(value = "") {
   return normalizeGroupName(value).split(" ").filter(Boolean);
 }
 
+const HOSPITAL_FACILITY_RE = /\b(hospital|clinic|medical\s+(centre|center|college)?|health\s*care|healthcare|diagnostics?|labs?|laborator(?:y|ies)|pathology|imaging|radiology|nursing\s+home|dental|eye\s+care|care\s+(centre|center))\b/i;
+const HOSPITAL_BAD_LABEL_RE = /^#|\b(laboratory\s+test\s+reports?|lab\s+reports?|test\s+reports?|medical\s+reports?|reports?|prescription|invoice|receipt|bill|patient|uhid|mrn|age|sex|gender|dob|sample|specimen|collection|collected|received|reported|printed|result|unit|range|reference|doctor|dr\.?|consultant|department)\b/i;
+const ADDRESS_WORD_RE = /\b(road|rd\.?|street|st\.?|nagar|colony|layout|sector|phase|near|opp\.?|opposite|floor|building|complex|city|district|state|pin|pincode|phone|mobile|email|www)\b/i;
+
+function cleanHospitalLabel(value = "") {
+  const text = String(value || "")
+    .replace(/^\s*#+\s*/, "")
+    .replace(/^\s*(hospital|clinic|lab|laboratory|diagnostics|facility|name)\s*[:\-]\s*/i, "")
+    .replace(/\b(laboratory\s+test\s+reports?|lab\s+reports?|test\s+reports?|medical\s+reports?|reports?|prescription|invoice|receipt|bill)\b.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const firstComma = text.split(",")[0]?.trim();
+  if (firstComma && HOSPITAL_FACILITY_RE.test(firstComma)) return firstComma;
+  return text;
+}
+
+function hospitalLabelScore(value = "") {
+  const label = cleanHospitalLabel(value);
+  if (!label || label.length < 3 || label.length > 90) return 0;
+  if (HOSPITAL_BAD_LABEL_RE.test(label)) return 0;
+  const words = label.split(/\s+/).filter(Boolean);
+  const hasFacility = HOSPITAL_FACILITY_RE.test(label);
+  if (!hasFacility && (words.length < 2 || ADDRESS_WORD_RE.test(label))) return 0;
+  if (/^\d+[\d\s,./-]*$/.test(label)) return 0;
+
+  let score = hasFacility ? 8 : 3;
+  if (/^[A-Z0-9 .,&'()-]+$/.test(label) || /\b[A-Z][a-z]{2,}\b/.test(label)) score += 1;
+  if (ADDRESS_WORD_RE.test(label)) score -= hasFacility ? 2 : 5;
+  if ((label.match(/\d/g) || []).length > 6) score -= 2;
+  if ((label.match(/,/g) || []).length > 1) score -= 1;
+  if (words.length > 8) score -= 1;
+  return Math.max(0, score);
+}
+
+function groupingQuality(value = "", mode = "hospital") {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  if (mode === "hospital") return hospitalLabelScore(text);
+  if (/not found/i.test(text)) return 0;
+  return normalizeGroupName(text) ? 5 : 0;
+}
+
+function isWeakGroupingValue(value = "", mode = "hospital") {
+  if (!String(value || "").trim()) return true;
+  return groupingQuality(value, mode) < (mode === "hospital" ? 5 : 2);
+}
+
+function bestGroupingCandidate(values = [], mode = "hospital") {
+  return values
+    .map((value) => ({ value: mode === "hospital" ? cleanHospitalLabel(value) : String(value || "").trim(), score: groupingQuality(value, mode) }))
+    .filter((item) => item.value && item.score > 0)
+    .sort((a, b) => b.score - a.score || a.value.length - b.value.length)[0]?.value || "";
+}
+
 function shouldMergeGroupNames(a = "", b = "", sameBatch = false) {
   const aTokens = normalizedTokens(a);
   const bTokens = normalizedTokens(b);
@@ -442,6 +556,7 @@ function findCompatibleGroup(map, group, doc) {
   for (const existing of map.values()) {
     if (existing.type !== group.type) continue;
     const sameBatch = Boolean(doc.batchId && existing.docs.some((item) => item.batchId === doc.batchId));
+    if (sameBatch && (isWeakGroupingValue(existing.label, group.type) || isWeakGroupingValue(group.label, group.type))) return existing;
     if (shouldMergeGroupNames(existing.label, group.label, sameBatch)) return existing;
   }
   return null;
@@ -469,7 +584,7 @@ function groupLabelForMode(mode) {
 }
 
 function recordGroupForDoc(doc = {}, mode = "hospital") {
-  const hospital = String(doc.hospital || "").trim();
+  const hospital = cleanHospitalLabel(doc.hospital || "");
   const doctor = String(doc.doctor || "").trim();
   const patient = String(doc.patientName || doc.patient || "").trim();
   const period = periodFromDate(doc.date);
@@ -484,9 +599,9 @@ function recordGroupForDoc(doc = {}, mode = "hospital") {
       };
     }
     return {
-      type: "period",
-      label: period,
-      key: `doctor-missing:${normalizeGroupName(period) || "unsorted"}`,
+      type: "doctor",
+      label: "Doctor not found",
+      key: `doctor-missing:${normalizeGroupName(hospital || period) || "unsorted"}`,
       helper: hospital ? `No doctor found - ${hospital}` : "No doctor found",
     };
   }
@@ -501,14 +616,14 @@ function recordGroupForDoc(doc = {}, mode = "hospital") {
       };
     }
     return {
-      type: "period",
-      label: period,
-      key: `patient-missing:${normalizeGroupName(period) || "unsorted"}`,
+      type: "patient",
+      label: "Patient not found",
+      key: `patient-missing:${normalizeGroupName(hospital || doctor || period) || "unsorted"}`,
       helper: "No patient name found",
     };
   }
 
-  if (hospital) {
+  if (hospital && !isWeakGroupingValue(hospital, "hospital")) {
     return {
       type: "hospital",
       label: hospital,
@@ -519,17 +634,17 @@ function recordGroupForDoc(doc = {}, mode = "hospital") {
 
   if (doctor) {
     return {
-      type: "doctor",
-      label: doctor,
-      key: `doctor:${normalizeGroupName(doctor) || doctor.toLowerCase()}`,
-      helper: period,
+      type: "hospital",
+      label: "Hospital not found",
+      key: `hospital-missing:${normalizeGroupName(doctor) || normalizeGroupName(period) || "unsorted"}`,
+      helper: `${doctor} - ${period}`,
     };
   }
 
   return {
-    type: "period",
-    label: period,
-    key: `period:${normalizeGroupName(period) || "unsorted"}`,
+    type: "hospital",
+    label: "Hospital not found",
+    key: `hospital-missing:${normalizeGroupName(period) || "unsorted"}`,
     helper: "Hospital or doctor not found",
   };
 }
@@ -537,7 +652,7 @@ function recordGroupForDoc(doc = {}, mode = "hospital") {
 function groupingValueForMode(doc = {}, mode = "hospital") {
   if (mode === "doctor") return String(doc.doctor || "").trim();
   if (mode === "patient") return String(doc.patientName || doc.patient || "").trim();
-  return String(doc.hospital || "").trim();
+  return cleanHospitalLabel(doc.hospital || "");
 }
 
 function buildGroupingFallbacks(docs = [], mode = "hospital") {
@@ -545,21 +660,33 @@ function buildGroupingFallbacks(docs = [], mode = "hospital") {
   for (const doc of docs) {
     if (!doc.batchId) continue;
     const value = groupingValueForMode(doc, mode);
-    if (value && !byBatch.has(doc.batchId)) byBatch.set(doc.batchId, value);
+    if (!value) continue;
+    const existing = byBatch.get(doc.batchId) || [];
+    existing.push(value);
+    byBatch.set(doc.batchId, existing);
+  }
+  for (const [batchId, values] of byBatch.entries()) {
+    const best = bestGroupingCandidate(values, mode);
+    if (best) byBatch.set(batchId, best);
+    else byBatch.delete(batchId);
   }
   return { byBatch };
 }
 
 function applyGroupingFallback(doc, docs, mode, fallbacks) {
-  if (groupingValueForMode(doc, mode)) return doc;
+  const current = groupingValueForMode(doc, mode);
+  if (current && !isWeakGroupingValue(current, mode)) {
+    if (mode === "hospital" && current !== doc.hospital) return { ...doc, hospital: current };
+    return doc;
+  }
   const fromBatch = doc.batchId ? fallbacks.byBatch.get(doc.batchId) : "";
   let value = fromBatch;
 
   if (!value && (isReuploadStatus(doc.status) || isProcessingStatus(doc.status))) {
     const docTime = doc.sortDate || 0;
     const nearby = docs
-      .filter((item) => item.id !== doc.id && groupingValueForMode(item, mode))
-      .map((item) => ({ item, distance: Math.abs((item.sortDate || 0) - docTime) }))
+      .map((item) => ({ item, value: groupingValueForMode(item, mode), distance: Math.abs((item.sortDate || 0) - docTime) }))
+      .filter((item) => item.item.id !== doc.id && item.value && !isWeakGroupingValue(item.value, mode))
       .filter((item) => item.distance <= 10 * 60 * 1000)
       .sort((a, b) => a.distance - b.distance)[0]?.item;
     value = groupingValueForMode(nearby, mode);
@@ -569,6 +696,47 @@ function applyGroupingFallback(doc, docs, mode, fallbacks) {
   if (mode === "doctor") return { ...doc, doctor: value, helperFallback: "Grouped with same upload" };
   if (mode === "patient") return { ...doc, patientName: value, helperFallback: "Grouped with same upload" };
   return { ...doc, hospital: value, helperFallback: "Grouped with same upload" };
+}
+
+function normalizeUploadTarget(context = null) {
+  if (!context || typeof context !== "object") return null;
+  const type = ["hospital", "doctor", "patient"].includes(context.type) ? context.type : context.mode;
+  if (!["hospital", "doctor", "patient"].includes(type)) return null;
+  const label = type === "hospital" ? cleanHospitalLabel(context.label) : String(context.label || "").trim();
+  if (!label || /not found/i.test(label)) return null;
+  if (type === "hospital" && isWeakGroupingValue(label, "hospital")) return null;
+  return {
+    type,
+    mode: context.mode || type,
+    label,
+    groupKey: context.groupKey || "",
+  };
+}
+
+function metadataForUploadTarget(target) {
+  if (!target) return {};
+  if (target.type === "doctor") return { doctor: target.label };
+  if (target.type === "patient") return { patientName: target.label };
+  return { hospital: target.label };
+}
+
+function resolveAnalysisMetadata(doc = {}, analysis = {}) {
+  const target = normalizeUploadTarget(doc.uploadTarget);
+  const analyzedHospital = cleanHospitalLabel(analysis?.hospital || "");
+  let hospital = analyzedHospital || doc.hospital || "";
+  let doctor = analysis?.doctor || doc.doctor || "";
+  let patientName = analysis?.patientName || doc.patientName || "";
+
+  if (target?.type === "hospital") {
+    const sameHospital = analyzedHospital && shouldMergeGroupNames(target.label, analyzedHospital, true);
+    if (!analyzedHospital || isWeakGroupingValue(analyzedHospital, "hospital") || sameHospital) {
+      hospital = target.label;
+    }
+  }
+  if (target?.type === "doctor" && (!doctor || shouldMergeGroupNames(target.label, doctor, true))) doctor = target.label;
+  if (target?.type === "patient" && (!patientName || normalizeGroupName(patientName) === normalizeGroupName(target.label))) patientName = target.label;
+
+  return { hospital, doctor, patientName };
 }
 
 function withRecordGroup(doc) {
@@ -670,10 +838,12 @@ async function pickUploadAssets(method) {
   return result.assets;
 }
 
-function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "") {
+function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "", uploadTargetContext = null) {
   const primary = localFiles[0];
   const now = new Date();
   const id = `doc-${now.getTime()}-${batchIndex}-${Math.random().toString(36).slice(2, 8)}`;
+  const uploadTarget = normalizeUploadTarget(uploadTargetContext);
+  const targetMetadata = metadataForUploadTarget(uploadTarget);
 
   return withRecordGroup({
     id,
@@ -681,8 +851,12 @@ function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "") {
     category: "others",
     date: formatDate(now),
     sortDate: now.getTime(),
-    doctor: "",
-    hospital: "",
+    uploadedAt: now.toISOString(),
+    uploadSortDate: now.getTime(),
+    batchIndex,
+    doctor: targetMetadata.doctor || "",
+    hospital: targetMetadata.hospital || "",
+    patientName: targetMetadata.patientName || "",
     tags: [],
     pages: localFiles.length || 1,
     ocr: "",
@@ -695,11 +869,12 @@ function createDraftDocument(method, localFiles, batchIndex = 0, batchId = "") {
     localUri: primary?.uri,
     localFiles,
     batchId,
+    uploadTarget,
     originalSaved: true,
   });
 }
 
-async function requestOcr(localFile, documentId, token, batchId) {
+async function requestOcr(localFile, documentId, token, batchId, batchIndex = 0) {
   const upload = await FileSystem.uploadAsync(`${API_BASE_URL}/api/ocr`, localFile.uri, {
     fieldName: "file",
     httpMethod: "POST",
@@ -710,6 +885,7 @@ async function requestOcr(localFile, documentId, token, batchId) {
       fileName: localFile.name || "medical-document",
       documentId: documentId || "",
       batchId: batchId || "",
+      batchIndex: String(batchIndex || 0),
     },
   });
   const data = (() => {
@@ -779,6 +955,7 @@ async function requestDocumentAnalysis(doc, ocrText, pageTexts = [], files = [],
       mimeType: doc.mimeType || "application/octet-stream",
       ocrText,
       ocrConfidence: doc.ocrConfidence,
+      batchIndex: doc.batchIndex || 0,
       pages: pageTexts.map((page) => ({
         page: page.page,
         confidence: page.confidence,
@@ -801,15 +978,16 @@ function applyAnalysisToDoc(doc, analysis, ocrText) {
   const tags = Array.isArray(analysis?.tags) ? analysis.tags.filter(Boolean).slice(0, 8) : doc.tags || [];
   const warnings = Array.isArray(analysis?.warnings) ? analysis.warnings : doc.warnings || [];
   const reuploadMessage = analysis?.reason || warnings[0] || "Reupload a clearer medical document.";
+  const metadata = resolveAnalysisMetadata(doc, analysis);
 
   if (!analysis || isReuploadStatus(analysis.status)) {
     return withRecordGroup({
       ...doc,
       title: analysis?.title || doc.title,
       category,
-      hospital: analysis?.hospital || doc.hospital,
-      doctor: analysis?.doctor || doc.doctor,
-      patientName: analysis?.patientName || doc.patientName,
+      hospital: metadata.hospital,
+      doctor: metadata.doctor,
+      patientName: metadata.patientName,
       date: analysis?.visitDate || doc.date,
       tags,
       ocr: ocrText,
@@ -839,9 +1017,9 @@ function applyAnalysisToDoc(doc, analysis, ocrText) {
     ...doc,
     title: analysis.title || doc.title,
     category,
-    hospital: analysis.hospital || doc.hospital,
-    doctor: analysis.doctor || doc.doctor,
-    patientName: analysis.patientName || doc.patientName,
+    hospital: metadata.hospital,
+    doctor: metadata.doctor,
+    patientName: metadata.patientName,
     date: analysis.visitDate || doc.date,
     tags,
     ocr: ocrText,
@@ -894,7 +1072,7 @@ async function runDocumentPipeline(doc, app, callbacks = {}) {
     setStage(`Running OCR on file ${i + 1} of ${files.length}`);
     setProgress(Math.min(70, 22 + Math.round((i / files.length) * 42)));
 
-    const ocr = await requestOcr(files[i], doc.id, app.authToken, doc.batchId);
+    const ocr = await requestOcr(files[i], doc.id, app.authToken, doc.batchId, doc.batchIndex);
     const responseText = textFromOcrResponse(ocr);
     const returnedPages = ocr.pageLevelText?.length
       ? ocr.pageLevelText
@@ -948,6 +1126,16 @@ async function runDocumentPipeline(doc, app, callbacks = {}) {
   const analysis = await requestDocumentAnalysis(analysisInput, combinedText, pageTexts, files, app.authToken);
   const updated = applyAnalysisToDoc(analysisInput, analysis, combinedText);
   app.updateDoc(updated);
+  const target = normalizeUploadTarget(updated.uploadTarget);
+  if (target && app.authToken) {
+    const targetPatch = metadataForUploadTarget(target);
+    await requestUpdateDocument(app.authToken, updated.documentId || updated.id, {
+      ...targetPatch,
+      ...(updated.hospital ? { hospital: updated.hospital } : {}),
+      ...(updated.doctor ? { doctor: updated.doctor } : {}),
+      ...(updated.patientName ? { patientName: updated.patientName } : {}),
+    }).catch(() => undefined);
+  }
   setProgress(100);
   setStage(updated.status === "ready" ? "Analysis complete" : "Reupload needed");
   return updated;
@@ -1053,6 +1241,8 @@ function providerLabel(value) {
 
 function normalizeRemoteDocument(doc = {}, localDoc = {}) {
   const date = doc.date ? new Date(doc.date) : null;
+  const uploadedAt = doc.uploadedAt || doc.createdAt || localDoc.uploadedAt || localDoc.createdAt || "";
+  const uploadTime = parseDateLike(uploadedAt) || Number(localDoc.uploadSortDate) || Number(localDoc.sortDate) || Date.now();
   const sortDate = Number.isFinite(doc.sortDate)
     ? doc.sortDate
     : date && !Number.isNaN(date.getTime())
@@ -1067,6 +1257,9 @@ function normalizeRemoteDocument(doc = {}, localDoc = {}) {
     category: isKnownCategory(doc.category) ? doc.category : localDoc.category || "others",
     date: typeof doc.date === "string" && doc.date.includes("T") ? formatDate(new Date(doc.date)) : doc.date || localDoc.date || formatDate(new Date()),
     sortDate,
+    uploadedAt,
+    uploadSortDate: uploadTime,
+    batchIndex: Number.isFinite(Number(doc.batchIndex)) ? Number(doc.batchIndex) : Number(localDoc.batchIndex) || 0,
     tags: Array.isArray(doc.tags) ? doc.tags : localDoc.tags || [],
     pages: doc.pages || localDoc.pages || 1,
     localFiles: localDoc.localFiles,
@@ -1134,7 +1327,7 @@ function AppButton({ children, icon: Icon, onPress, tone = "primary", disabled =
   if (tone === "primary") {
     return (
       <TouchableOpacity disabled={disabled} activeOpacity={0.82} onPress={onPress} style={[styles.buttonTouch, style]}>
-        <LinearGradient colors={disabled ? ["#E9E0E3", "#E9E0E3"] : [C.primary, C.primary2, C.primary3]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.button}>
+        <LinearGradient colors={disabled ? ["#E5E7EB", "#E5E7EB"] : [C.primary, C.primary2]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.button}>
           {content}
         </LinearGradient>
       </TouchableOpacity>
@@ -1327,6 +1520,59 @@ function DocumentMock({ compact = false }) {
   );
 }
 
+function PdfPreview({ uri, headers, full = false, compact = false }) {
+  const [page, setPage] = useState(1);
+  const [pages, setPages] = useState(0);
+  const [failed, setFailed] = useState(false);
+  const source = useMemo(() => uri ? { uri, headers, cache: true } : null, [uri, headers]);
+  const pdfStyle = full ? styles.pdfFullPreview : compact ? styles.pdfCompactPreview : styles.pdfNativePreview;
+
+  useEffect(() => {
+    setPage(1);
+    setPages(0);
+    setFailed(false);
+  }, [uri]);
+
+  if (!source || failed) {
+    return (
+      <View style={[styles.pdfRenderFallback, full && styles.pdfRenderFallbackFull]}>
+        <FileText size={full ? 52 : 38} color={C.primary} />
+        <Text style={styles.pdfFallbackTitle}>PDF preview unavailable</Text>
+        <Text style={styles.pdfFallbackText}>The original PDF is saved. Try opening it full screen or reupload if the file is corrupted.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.pdfPreviewShell, full && styles.pdfPreviewShellFull]}>
+      <Pdf
+        source={source}
+        style={pdfStyle}
+        trustAllCerts={false}
+        enableAnnotationRendering
+        enableDoubleTapZoom={full}
+        enablePaging={full}
+        scrollEnabled={full}
+        singlePage={!full}
+        spacing={full ? 8 : 0}
+        fitPolicy={0}
+        onLoadComplete={(numberOfPages) => {
+          setPages(numberOfPages);
+          setFailed(false);
+        }}
+        onPageChanged={(nextPage) => setPage(nextPage)}
+        onError={() => setFailed(true)}
+        renderActivityIndicator={() => <ActivityIndicator size="small" color={C.primary} />}
+      />
+      {!!pages && (
+        <View style={styles.pdfPageBadge}>
+          <Text style={styles.pdfPageBadgeText}>{page} / {pages}</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
 function EmptyState({ icon: Icon, title, subtitle }) {
   return (
     <View style={styles.emptyState}>
@@ -1380,11 +1626,25 @@ function Welcome({ nav }) {
             <Text style={styles.brandTag}>Capture. Organize. Retrieve.</Text>
           </View>
         </View>
-        <LinearGradient colors={[C.primary, C.primary2, C.primary3]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.welcomeCard}>
+        <LinearGradient colors={[C.primary, "#481224"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.welcomeCard}>
           <ShieldCheck size={24} color="#fff" />
           <Text style={styles.welcomeTitle}>Your medical vault is ready.</Text>
           <Text style={styles.welcomeBody}>Create a secure vault or login with your existing mobile number.</Text>
         </LinearGradient>
+        <View style={styles.welcomeProofGrid}>
+          <View style={styles.welcomeProofItem}>
+            <Lock size={17} color={C.primary} />
+            <Text style={styles.welcomeProofText}>OTP secured</Text>
+          </View>
+          <View style={styles.welcomeProofItem}>
+            <FolderOpen size={17} color={C.blue} />
+            <Text style={styles.welcomeProofText}>Originals saved</Text>
+          </View>
+          <View style={styles.welcomeProofItem}>
+            <Building2 size={17} color={C.teal} />
+            <Text style={styles.welcomeProofText}>Hospital files</Text>
+          </View>
+        </View>
         <View style={styles.flexFill} />
         <AppButton icon={UserRound} onPress={() => nav.push("phone", { mode: "signup" })} style={styles.fullWidth}>Create account</AppButton>
         <AppButton tone="soft" icon={Phone} onPress={() => nav.push("phone", { mode: "login" })} style={[styles.fullWidth, { marginTop: 12 }]}>Login</AppButton>
@@ -1582,56 +1842,25 @@ function SegmentButton({ label, active, onPress, icon: Icon }) {
 }
 
 function HomeScreen({ nav, app }) {
-  const readyCount = app.docs.filter((doc) => doc.status === "ready" || !doc.status).length;
-  const reuploadCount = app.docs.filter((doc) => isReuploadStatus(doc.status)).length;
+  const processingCount = app.docs.filter((doc) => isProcessingStatus(doc.status)).length;
+  const latestDoc = app.docs[0];
   const firstName = app.user.name?.trim()?.split(" ")[0] || "there";
   return (
     <Screen bottomPad={122}>
       <Header nav={nav} app={app} />
       <View style={styles.pageBody}>
-        <LinearGradient colors={["#FFF7FA", "#FFE1EC", "#FA8DB1"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.homeHeroCard}>
-          <View style={styles.homeHeroTop}>
-            <View style={styles.homeHeroMark}>
-              <MedicalCross size={34} color={C.primary} />
-            </View>
-            <View style={styles.flexFill}>
-              <Text style={styles.homeHeroEyebrow}>Heault vault</Text>
-              <Text style={styles.homeHeroTitle}>Good morning, {firstName}</Text>
-            </View>
-          </View>
-          <Text style={styles.homeHeroText}>Capture medical papers, organize them by hospital, and retrieve them when you visit again.</Text>
-          <View style={styles.homeHeroStats}>
-            <View>
-              <Text style={styles.homeHeroNumber}>{app.docs.length}</Text>
-              <Text style={styles.homeHeroLabel}>Documents</Text>
-            </View>
-            <View style={styles.homeHeroDivider} />
-            <View>
-              <Text style={styles.homeHeroNumber}>{readyCount}</Text>
-              <Text style={styles.homeHeroLabel}>Ready</Text>
-            </View>
-            <View style={styles.homeHeroDivider} />
-            <View>
-              <Text style={styles.homeHeroNumber}>{reuploadCount}</Text>
-              <Text style={styles.homeHeroLabel}>Reupload</Text>
-            </View>
-          </View>
-          <TouchableOpacity activeOpacity={0.84} onPress={() => app.startUpload?.("gallery")} style={styles.homeHeroAction}>
-            <Plus size={18} color="#fff" />
-            <Text style={styles.homeHeroActionText}>Add medical document</Text>
-          </TouchableOpacity>
-        </LinearGradient>
+        <VaultDrawerHero firstName={firstName} onUpload={() => app.openUploadSheet?.()} />
 
         <View style={styles.infoGrid}>
           <Card style={styles.infoCard}>
             <Stethoscope size={20} color={C.primary} />
             <Text style={styles.infoLabel}>Last doctor visit</Text>
-            <Text style={styles.infoValue}>{app.user.lastDoctorVisit.date}</Text>
+            <Text style={styles.infoValue} numberOfLines={1}>{app.user.lastDoctorVisit.date}</Text>
           </Card>
           <Card style={styles.infoCard}>
-            <Syringe size={20} color={C.green} />
-            <Text style={styles.infoLabel}>Vaccinations</Text>
-            <Text style={styles.infoValue}>{app.user.vaccineRecord.total}</Text>
+            <Clock size={20} color={processingCount ? C.blue : C.green} />
+            <Text style={styles.infoLabel}>{processingCount ? "Processing now" : "Latest upload"}</Text>
+            <Text style={styles.infoValue} numberOfLines={1}>{processingCount || displayDateLabel(latestDoc?.date, latestDoc?.sortDate)}</Text>
           </Card>
         </View>
 
@@ -1651,10 +1880,95 @@ function HomeScreen({ nav, app }) {
         </ScrollView>
         <SectionTitle text="Recently uploaded" action="See all" onAction={() => nav.go("records")} />
         <View style={styles.stackGap}>
-          {app.docs.slice(0, 3).map((doc) => <DocumentRow key={doc.id} doc={doc} onPress={() => openDocument(nav, doc)} />)}
+          {app.docs.length ? (
+            app.docs.slice(0, 3).map((doc) => <DocumentRow key={doc.id} doc={doc} onPress={() => openDocument(nav, doc)} />)
+          ) : (
+            <EmptyState icon={Files} title="No documents yet" subtitle="Upload your first medical document to start building the vault." />
+          )}
         </View>
       </View>
     </Screen>
+  );
+}
+
+function VaultDrawerHero({ firstName, onUpload }) {
+  const drawerLift = useRef(new Animated.Value(0)).current;
+  const sealPulse = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const liftLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(drawerLift, { toValue: 1, duration: 1500, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+        Animated.timing(drawerLift, { toValue: 0, duration: 1500, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+      ])
+    );
+    const pulseLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(sealPulse, { toValue: 1, duration: 900, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.timing(sealPulse, { toValue: 0, duration: 900, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+      ])
+    );
+    liftLoop.start();
+    pulseLoop.start();
+    return () => {
+      liftLoop.stop();
+      pulseLoop.stop();
+    };
+  }, [drawerLift, sealPulse]);
+
+  const translateY = drawerLift.interpolate({ inputRange: [0, 1], outputRange: [0, -8] });
+  const sealScale = sealPulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.045] });
+
+  return (
+    <LinearGradient colors={["#FFFFFF", "#F8EEF2", "#EAF5F6"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.homeHeroCard}>
+      <View style={styles.heroSecurePill}>
+        <Lock size={13} color={C.green} />
+        <Text style={styles.heroSecureText}>Secure vault active</Text>
+      </View>
+
+      <View style={styles.vaultHeroVisual}>
+        <View style={styles.vaultDrawerBack} />
+        <Animated.View style={[styles.vaultFileStack, { transform: [{ translateY }] }]}>
+          <View style={[styles.vaultFilePaper, styles.vaultFilePaperBack]} />
+          <View style={[styles.vaultFilePaper, styles.vaultFilePaperMid]} />
+          <View style={styles.vaultFileFront}>
+            <View style={styles.vaultFileTab} />
+            <View style={styles.vaultFileHeader}>
+              <View style={styles.vaultFileMark}>
+                <MedicalCross size={16} color={C.primary} />
+              </View>
+              <View style={styles.vaultFileLines}>
+                <View style={[styles.vaultLineStrong, { width: 86 }]} />
+                <View style={[styles.vaultLineSoft, { width: 54 }]} />
+              </View>
+            </View>
+            <View style={styles.vaultFileRows}>
+              <View style={[styles.vaultLineSoft, { width: "86%" }]} />
+              <View style={[styles.vaultLineSoft, { width: "64%" }]} />
+              <View style={styles.vaultMiniGrid}>
+                <View style={styles.vaultMiniCell} />
+                <View style={styles.vaultMiniCell} />
+                <View style={styles.vaultMiniCell} />
+              </View>
+            </View>
+          </View>
+        </Animated.View>
+        <View style={styles.vaultDrawerBase}>
+          <View style={styles.vaultDrawerHandle} />
+        </View>
+        <Animated.View style={[styles.vaultSeal, { transform: [{ scale: sealScale }] }]}>
+          <ShieldCheck size={22} color="#fff" />
+        </Animated.View>
+      </View>
+
+      <Text style={styles.homeHeroGreeting}>Good morning, {firstName}</Text>
+      <Text style={styles.homeHeroTitle}>Your medical records, neatly filed.</Text>
+      <Text style={styles.homeHeroText}>Private, organized, ready for your next visit.</Text>
+      <TouchableOpacity activeOpacity={0.84} onPress={onUpload} style={styles.homeHeroAction}>
+        <Plus size={18} color="#fff" />
+        <Text style={styles.homeHeroActionText}>Add document</Text>
+      </TouchableOpacity>
+    </LinearGradient>
   );
 }
 
@@ -1676,16 +1990,13 @@ function RecordsScreen({ nav, app, params }) {
   }, [app.docs]);
   const groups = useMemo(() => groupRecords(results, "latest", viewMode), [results, viewMode]);
 
-  const readyCount = app.docs.filter((doc) => doc.status === "ready" || !doc.status).length;
-  const reuploadCount = app.docs.filter((doc) => isReuploadStatus(doc.status)).length;
-
   return (
     <Screen bottomPad={122}>
       <Header nav={nav} app={app} title="Records" />
       <View style={styles.pageBody}>
         <View style={styles.simplePageHeader}>
-          <Text style={styles.simplePageTitle}>Medical records</Text>
-          <Text style={styles.simplePageSubtitle}>Open your saved files by hospital, doctor, or patient.</Text>
+          <Text style={styles.simplePageTitle}>Records drawer</Text>
+          <Text style={styles.simplePageSubtitle}>Files are grouped for fast retrieval during visits. Open a file to view every original image or PDF first.</Text>
         </View>
 
         <View style={styles.recordsModeTabs}>
@@ -1694,13 +2005,19 @@ function RecordsScreen({ nav, app, params }) {
           <DrawerModeButton label="Patient" icon={UserRound} active={viewMode === "patient"} onPress={() => setViewMode("patient")} />
         </View>
 
-        <View style={styles.recordsStatsGrid}>
-          <RecordsStat icon={Files} label="Total files" value={app.docs.length} tone="blue" />
-          <RecordsStat icon={ShieldCheck} label="Ready" value={readyCount} tone="green" />
-          <RecordsStat icon={RefreshCcw} label="Reupload" value={reuploadCount} tone="amber" />
+        <View style={styles.drawerSummaryBar}>
+          <View style={styles.drawerSummaryIcon}>
+            <FolderOpen size={18} color={C.primary} />
+          </View>
+          <View style={styles.flexFill}>
+            <Text style={styles.drawerSummaryTitle}>{groups.length} {viewMode} file{groups.length === 1 ? "" : "s"}</Text>
+            <Text style={styles.drawerSummaryText}>{app.docs.length} original document{app.docs.length === 1 ? "" : "s"} saved</Text>
+          </View>
+          <TouchableOpacity activeOpacity={0.78} onPress={() => app.startUpload?.("gallery")} style={styles.drawerSummaryAdd}>
+            <Plus size={18} color="#fff" />
+          </TouchableOpacity>
         </View>
 
-        <SectionTitle text={`${groups.length} ${viewMode} file${groups.length === 1 ? "" : "s"}`} action="Upload" onAction={() => app.startUpload?.("gallery")} />
         {results.length === 0 ? (
           <EmptyState icon={Files} title={`No ${viewMode} records yet`} subtitle="Upload medical documents to build your records drawer." />
         ) : (
@@ -1741,9 +2058,10 @@ function groupRecords(docs, sort = "latest", mode = "hospital") {
       categories: new Set(),
       pageCount: 0,
     };
+    const dateValue = visitSortDate(doc);
     existing.docs.push(doc);
-    existing.latestSortDate = Math.max(existing.latestSortDate, doc.sortDate || 0);
-    existing.oldestSortDate = Math.min(existing.oldestSortDate, doc.sortDate || 0);
+    existing.latestSortDate = Math.max(existing.latestSortDate, dateValue || 0);
+    existing.oldestSortDate = Math.min(existing.oldestSortDate, dateValue || 0);
     existing.categories.add(categoryFor(doc.category).label);
     existing.pageCount += Number(doc.pages || 1);
     map.set(group.key, existing);
@@ -1751,7 +2069,7 @@ function groupRecords(docs, sort = "latest", mode = "hospital") {
 
   const groups = [...map.values()].map((group) => ({
     ...group,
-    docs: group.docs.sort((a, b) => (b.sortDate || 0) - (a.sortDate || 0)),
+    docs: group.docs.sort((a, b) => visitSortDate(b) - visitSortDate(a)),
     categoryLabels: [...group.categories].slice(0, 3),
   }));
 
@@ -1760,6 +2078,23 @@ function groupRecords(docs, sort = "latest", mode = "hospital") {
     if (sort === "oldest") return (a.latestSortDate || 0) - (b.latestSortDate || 0);
     return (b.latestSortDate || 0) - (a.latestSortDate || 0);
   });
+}
+
+function dateRangeForDocs(docs = []) {
+  const cleanDates = docs
+    .map((doc) => ({ label: doc.date || "", sortDate: visitSortDate(doc) }))
+    .filter((item) => item.label || item.sortDate)
+    .sort((a, b) => (a.sortDate || 0) - (b.sortDate || 0));
+  if (!cleanDates.length) return "No date";
+  const first = displayDateLabel(cleanDates[0]?.label, cleanDates[0]?.sortDate);
+  const last = displayDateLabel(cleanDates[cleanDates.length - 1]?.label, cleanDates[cleanDates.length - 1]?.sortDate);
+  return first === last ? first : `${first} - ${last}`;
+}
+
+function statusForDocs(docs = []) {
+  if (docs.some((doc) => isReuploadStatus(doc.status))) return "needs_reupload";
+  if (docs.some((doc) => isProcessingStatus(doc.status))) return "processing";
+  return "ready";
 }
 
 function RecordGroupCard({ group, nav, mode }) {
@@ -1772,28 +2107,29 @@ function RecordGroupCard({ group, nav, mode }) {
   const Icon = typeIcon[group.type] || FolderOpen;
   const processing = group.docs.filter((doc) => isProcessingStatus(doc.status)).length;
   const reuploadCount = group.docs.filter((doc) => isReuploadStatus(doc.status)).length;
-  const latestDoc = group.docs[0];
   const openGroup = () => nav.push("recordGroup", { groupKey: group.key, mode });
+  const groupStatus = reuploadCount ? "needs_reupload" : processing ? "processing" : "ready";
+  const lastVisit = lastVisitForDocs(group.docs);
 
   return (
-    <View style={styles.recordGroupCard}>
+    <TouchableOpacity activeOpacity={0.86} onPress={openGroup} style={styles.recordGroupCard}>
+      <View style={styles.fileFolderShadow} />
       <View style={styles.folderTab}>
         <Icon size={14} color={C.primary} />
         <Text style={styles.folderTabText}>{groupLabelForMode(group.type)}</Text>
       </View>
-      <TouchableOpacity activeOpacity={0.82} onPress={openGroup} style={styles.recordGroupHeader}>
+      <View style={styles.recordGroupHeader}>
         <View style={styles.recordGroupIcon}>
           <Icon size={21} color={C.primary} />
         </View>
         <View style={styles.flexFill}>
           <Text style={styles.recordGroupTitle} numberOfLines={1}>{group.label}</Text>
           <Text style={styles.recordGroupSub} numberOfLines={1}>
-            {group.helper || `Latest ${latestDoc?.date || "-"}`}
+            Last visit: {lastVisit}
           </Text>
         </View>
-        {!!processing && <StatusPill status="processing" />}
-        {!processing && <ChevronRight size={18} color={C.primary} />}
-      </TouchableOpacity>
+        {groupStatus === "ready" ? <ChevronRight size={19} color={C.primary} /> : <StatusPill status={groupStatus} />}
+      </View>
       <View style={styles.recordGroupMetaRow}>
         <View style={styles.recordGroupMetric}>
           <Files size={14} color={C.primary} />
@@ -1809,59 +2145,533 @@ function RecordGroupCard({ group, nav, mode }) {
             <Text style={[styles.recordGroupMeta, { color: C.amber }]}>{reuploadCount} reupload</Text>
           </View>
         )}
+        <View style={styles.recordGroupMetric}>
+          <CalendarClock size={14} color={C.primary} />
+          <Text style={styles.recordGroupMeta}>Last visit {lastVisit}</Text>
+        </View>
       </View>
-      <View style={styles.drawerFileStack}>
-        {group.docs.slice(0, 3).map((doc, index) => (
-          <TouchableOpacity key={doc.id} activeOpacity={0.78} onPress={() => openDocument(nav, doc)} style={[styles.drawerFileRow, index > 0 && styles.drawerFileRowOverlap]}>
-            <View style={[styles.drawerFileStripe, { backgroundColor: categoryFor(doc.category).color }]} />
-            <View style={styles.flexFill}>
-              <Text style={styles.drawerFileTitle} numberOfLines={1}>{doc.title}</Text>
-              <Text style={styles.drawerFileMeta} numberOfLines={1}>{categoryFor(doc.category).label} - {doc.date || "Date not found"}</Text>
-            </View>
-            <StatusPill status={doc.status || "ready"} />
-          </TouchableOpacity>
-        ))}
-        {group.docs.length > 3 && (
-          <TouchableOpacity activeOpacity={0.78} onPress={openGroup} style={styles.drawerMoreRow}>
-            <Files size={15} color={C.primary} />
-            <Text style={styles.drawerMoreText}>{group.docs.length - 3} more document{group.docs.length - 3 === 1 ? "" : "s"}</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-      <TouchableOpacity activeOpacity={0.78} onPress={openGroup} style={styles.recordGroupOpenRow}>
+      <View style={styles.recordGroupOpenRow}>
         <Text style={styles.recordGroupOpenText}>Open {groupLabelForMode(group.type).toLowerCase()} file</Text>
         <ChevronRight size={16} color={C.primary} />
-      </TouchableOpacity>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+function remoteOriginalUrl(documentId, index) {
+  return `${API_BASE_URL}/api/documents/${encodeURIComponent(documentId || "")}/originals/${index}`;
+}
+
+function sourceForOriginalFile(file = {}) {
+  const safeFile = file || {};
+  return safeFile.headers
+    ? { uri: safeFile.uri, headers: safeFile.headers }
+    : { uri: safeFile.uri };
+}
+
+function originalFilesForDoc(doc = {}, token = "") {
+  if (doc.localFiles?.length) return doc.localFiles;
+  if (doc.localUri) return [{ uri: doc.localUri, name: doc.fileName, mimeType: doc.mimeType }];
+
+  const remoteOriginals = Array.isArray(doc.originalFiles) && doc.originalFiles.length
+    ? doc.originalFiles
+    : doc.originalStorage
+      ? [doc.originalStorage]
+      : [];
+  if (!remoteOriginals.length || !(doc.documentId || doc.id)) return [];
+  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+  return remoteOriginals.map((file, index) => ({
+    uri: remoteOriginalUrl(doc.documentId || doc.id, index),
+    name: file?.fileName || doc.fileName || `original-${index + 1}`,
+    mimeType: file?.mimeType || doc.mimeType || "application/octet-stream",
+    size: file?.size,
+    headers,
+    remote: true,
+  }));
+}
+
+function primaryOriginalForDoc(doc = {}, token = "") {
+  return originalFilesForDoc(doc, token)[0] || null;
+}
+
+function originalPagesForDocs(docs = [], token = "") {
+  return docs.flatMap((doc) => {
+    const files = originalFilesForDoc(doc, token);
+    return files.map((file, index) => ({ doc, file, index }));
+  });
+}
+
+function originalSortDate(item = {}) {
+  return uploadSortDate(item.doc) || Number(item.doc?.sortDate) || 0;
+}
+
+function compareOriginalUploadOrder(a = {}, b = {}) {
+  const dateDiff = originalSortDate(b) - originalSortDate(a);
+  if (dateDiff) return dateDiff;
+  const batchDiff = (Number(a.doc?.batchIndex) || 0) - (Number(b.doc?.batchIndex) || 0);
+  if (batchDiff) return batchDiff;
+  const fileDiff = (Number(a.index) || 0) - (Number(b.index) || 0);
+  if (fileDiff) return fileDiff;
+  return String(a.doc?.id || "").localeCompare(String(b.doc?.id || ""));
+}
+
+function originalDateLabel(item = {}) {
+  return displayDateLabel(item.doc?.uploadedAt || item.doc?.createdAt, originalSortDate(item));
+}
+
+function originalMonthLabel(item = {}) {
+  const time = originalSortDate(item);
+  if (!time) return originalDateLabel(item);
+  return new Date(time).toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+}
+
+function truncateTextAtBoundary(text = "", limit = EXTRACTED_TEXT_PREVIEW_LIMIT) {
+  const value = String(text || "");
+  if (value.length <= limit) return value;
+  const paragraph = value.lastIndexOf("\n\n", limit);
+  const line = value.lastIndexOf("\n", limit);
+  const cut = paragraph > limit * 0.45 ? paragraph : line > limit * 0.55 ? line : limit;
+  return value.slice(0, cut).trim();
+}
+
+function compactCategoryList(values = []) {
+  const clean = uniqueCleanValues(values);
+  if (!clean.length) return "";
+  if (clean.length <= 3) return clean.join(", ");
+  return `${clean.slice(0, 3).join(", ")} +${clean.length - 3}`;
+}
+
+function monthKeyForDoc(doc = {}) {
+  const time = visitSortDate(doc);
+  if (!time) return "No date";
+  const date = new Date(time);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function monthLabelFromKey(key = "") {
+  if (key === "No date") return "No date found";
+  const [year, month] = key.split("-").map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+}
+
+function buildRecordOverviewText(group, intelligence, lastVisit, dateRange) {
+  const docs = intelligence.docs || [];
+  if (!docs.length) return "";
+  const pageCount = docs.reduce((sum, doc) => sum + Number(doc.pages || 1), 0);
+  const fileKind = groupLabelForMode(group?.type).toLowerCase();
+  const sourceLines = [
+    intelligence.hospitals.length ? `Hospital: ${compactList(intelligence.hospitals)}` : "",
+    intelligence.doctors.length ? `Doctor: ${compactList(intelligence.doctors)}` : "",
+    intelligence.patients.length ? `Patient: ${compactList(intelligence.patients)}` : "",
+    intelligence.categories.length ? `Document types: ${compactList(intelligence.categories)}` : "",
+  ].filter(Boolean);
+
+  const monthly = new Map();
+  docs.forEach((doc) => {
+    const key = monthKeyForDoc(doc);
+    const existing = monthly.get(key) || { sort: visitSortDate(doc) || 0, count: 0, pages: 0, categories: [] };
+    existing.sort = Math.max(existing.sort, visitSortDate(doc) || 0);
+    existing.count += 1;
+    existing.pages += Number(doc.pages || 1);
+    existing.categories.push(categoryFor(doc.category).label);
+    monthly.set(key, existing);
+  });
+  const monthLines = [...monthly.entries()]
+    .sort((a, b) => (b[1].sort || 0) - (a[1].sort || 0))
+    .map(([key, value]) => `- ${monthLabelFromKey(key)}: ${value.count} document${value.count === 1 ? "" : "s"}, ${value.pages} page${value.pages === 1 ? "" : "s"}${value.categories.length ? `, ${compactCategoryList(value.categories)}` : ""}`);
+
+  const noteLines = docs
+    .map((doc) => {
+      const summary = usefulSummaryForDoc(doc);
+      if (!summary) return "";
+      return `- ${displayDateLabel(doc.date, visitSortDate(doc))}: ${summary.replace(/\n+/g, " ")}`;
+    })
+    .filter(Boolean)
+    .slice(0, 12);
+
+  return cleanReadableText([
+    "## Overview",
+    `This ${fileKind} record contains ${docs.length} document${docs.length === 1 ? "" : "s"} and ${pageCount} page${pageCount === 1 ? "" : "s"} across ${dateRange}. Latest visit: ${lastVisit}.`,
+    sourceLines.length ? sourceLines.map((line) => `- ${line}`).join("\n") : "",
+    monthLines.length ? ["## Timeline", monthLines.join("\n")].join("\n\n") : "",
+    noteLines.length ? ["## Document notes", noteLines.join("\n")].join("\n\n") : "",
+  ].filter(Boolean).join("\n\n"));
+}
+
+function OriginalPreviewPage({ item, width, zoom = 1, rotation = 0, full = false }) {
+  const isImage = item?.file?.mimeType?.startsWith("image/");
+  const isPdf = isPdfMime(item?.file?.mimeType, item?.file?.name);
+  const pageStyle = full
+    ? [styles.galleryModalPage, { width }]
+    : [styles.groupPreviewPage, { width }];
+  const imageStyle = full ? styles.galleryModalImage : styles.groupPreviewImage;
+
+  return (
+    <View style={pageStyle}>
+      {isPdf ? (
+        <PdfPreview uri={item.file.uri} headers={item.file.headers} full={full} />
+      ) : (
+      <Animated.View style={{ transform: [{ scale: zoom }, { rotate: `${rotation}deg` }] }}>
+        {isImage ? (
+          <Image source={sourceForOriginalFile(item.file)} style={imageStyle} resizeMode="contain" />
+        ) : (
+          <View style={full ? styles.galleryPdfPreview : styles.groupPdfPreview}>
+            <FileText size={full ? 50 : 36} color={C.primary} />
+            <Text style={full ? styles.galleryPdfTitle : styles.groupPdfTitle}>Original file</Text>
+          </View>
+        )}
+      </Animated.View>
+      )}
     </View>
   );
 }
 
-function originalPagesForDocs(docs = []) {
-  return docs.flatMap((doc) => {
-    const files = doc.localFiles?.length
-      ? doc.localFiles
-      : doc.localUri
-        ? [{ uri: doc.localUri, name: doc.fileName, mimeType: doc.mimeType }]
-        : [];
-    return files.map((file, index) => ({ doc, file, index }));
-  });
+function TimelineScrubber({ items, selectedIndex, onChange }) {
+  const [railWidth, setRailWidth] = useState(1);
+  const [isDragging, setIsDragging] = useState(false);
+  const [displayIndex, setDisplayIndex] = useState(selectedIndex);
+  const progressAnim = useRef(new Animated.Value(0)).current;
+  const railTouchRef = useRef(null);
+  const railPageXRef = useRef(0);
+  const activeIndexRef = useRef(selectedIndex);
+  const displayIndexRef = useRef(selectedIndex);
+  const activeIndex = isDragging ? displayIndex : selectedIndex;
+  const selected = items[Math.min(activeIndex, Math.max(0, items.length - 1))];
+  const start = items[0];
+  const end = items[items.length - 1];
+  const selectedProgress = items.length > 1 ? selectedIndex / (items.length - 1) : 0;
+  const fillWidth = progressAnim.interpolate({ inputRange: [0, 1], outputRange: [0, Math.max(1, railWidth)] });
+  const thumbTranslate = progressAnim.interpolate({ inputRange: [0, 1], outputRange: [-17, Math.max(1, railWidth) - 17] });
+
+  const measureRail = useCallback(() => {
+    railTouchRef.current?.measureInWindow?.((x, _y, width) => {
+      railPageXRef.current = x || 0;
+      if (width) setRailWidth(Math.max(1, width));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (isDragging) return;
+    activeIndexRef.current = selectedIndex;
+    displayIndexRef.current = selectedIndex;
+    setDisplayIndex(selectedIndex);
+    progressAnim.setValue(selectedProgress);
+  }, [isDragging, progressAnim, selectedIndex, selectedProgress]);
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(measureRail);
+    return () => cancelAnimationFrame(frame);
+  }, [measureRail, railWidth]);
+
+  const updateFromPosition = useCallback((pageX = 0, fallbackLocalX = 0) => {
+    if (!items.length) return;
+    const width = Math.max(1, railWidth);
+    const localX = railPageXRef.current ? pageX - railPageXRef.current : fallbackLocalX;
+    const nextProgress = Math.max(0, Math.min(1, localX / width));
+    const nextIndex = items.length > 1 ? Math.round(nextProgress * (items.length - 1)) : 0;
+    activeIndexRef.current = nextIndex;
+    progressAnim.setValue(nextProgress);
+    if (displayIndexRef.current !== nextIndex) {
+      displayIndexRef.current = nextIndex;
+      setDisplayIndex(nextIndex);
+    }
+  }, [items.length, progressAnim, railWidth]);
+
+  const commitDrag = useCallback(() => {
+    const nextIndex = Math.max(0, Math.min(items.length - 1, activeIndexRef.current || 0));
+    const nextProgress = items.length > 1 ? nextIndex / (items.length - 1) : 0;
+    setIsDragging(false);
+    displayIndexRef.current = nextIndex;
+    setDisplayIndex(nextIndex);
+    Animated.spring(progressAnim, {
+      toValue: nextProgress,
+      speed: 18,
+      bounciness: 3,
+      useNativeDriver: false,
+    }).start();
+    if (nextIndex !== selectedIndex) onChange?.(nextIndex, { animated: false, source: "timeline" });
+  }, [items.length, onChange, progressAnim, selectedIndex]);
+
+  const stepTimeline = useCallback((direction) => {
+    const nextIndex = Math.max(0, Math.min(items.length - 1, selectedIndex + direction));
+    activeIndexRef.current = nextIndex;
+    displayIndexRef.current = nextIndex;
+    setDisplayIndex(nextIndex);
+    Animated.spring(progressAnim, {
+      toValue: items.length > 1 ? nextIndex / (items.length - 1) : 0,
+      speed: 18,
+      bounciness: 2,
+      useNativeDriver: false,
+    }).start();
+    if (nextIndex !== selectedIndex) onChange?.(nextIndex, { animated: true, source: "timeline-step" });
+  }, [items.length, onChange, progressAnim, selectedIndex]);
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => items.length > 0,
+    onMoveShouldSetPanResponder: () => items.length > 1,
+    onShouldBlockNativeResponder: () => true,
+    onPanResponderGrant: (event) => {
+      measureRail();
+      setIsDragging(true);
+      updateFromPosition(event.nativeEvent.pageX || 0, event.nativeEvent.locationX || 0);
+    },
+    onPanResponderMove: (event, gestureState) => {
+      updateFromPosition(gestureState.moveX || event.nativeEvent.pageX || 0, event.nativeEvent.locationX || 0);
+    },
+    onPanResponderRelease: commitDrag,
+    onPanResponderTerminate: commitDrag,
+  }), [commitDrag, items.length, measureRail, updateFromPosition]);
+
+  if (!items.length) return null;
+
+  return (
+    <View style={styles.timelinePanel}>
+      <View style={styles.timelineHeader}>
+        <View style={styles.flexFill}>
+          <Text style={styles.timelineLabel}>Upload timeline</Text>
+          <Text style={styles.timelineDate} numberOfLines={1}>Uploaded {originalDateLabel(selected)}</Text>
+        </View>
+        <View style={styles.timelineCountPill}>
+          <Text style={styles.timelinePosition}>{activeIndex + 1} / {items.length}</Text>
+        </View>
+      </View>
+      <View style={styles.timelineControlRow}>
+        <TouchableOpacity
+          activeOpacity={0.78}
+          disabled={selectedIndex <= 0}
+          onPress={() => stepTimeline(-1)}
+          style={[styles.timelineStepButton, selectedIndex <= 0 && styles.timelineStepDisabled]}
+        >
+          <ChevronLeft size={18} color={selectedIndex <= 0 ? C.line2 : C.primary} />
+        </TouchableOpacity>
+        <View
+          ref={railTouchRef}
+          style={styles.timelineRailTouch}
+          onLayout={(event) => {
+            setRailWidth(Math.max(1, event.nativeEvent.layout.width));
+            requestAnimationFrame(measureRail);
+          }}
+          {...panResponder.panHandlers}
+        >
+          <View style={styles.timelineRailOuter}>
+            <View style={styles.timelineRail} />
+            <Animated.View style={[styles.timelineRailFill, { width: fillWidth }]} />
+            <Animated.View style={[styles.timelineThumb, isDragging && styles.timelineThumbActive, { transform: [{ translateX: thumbTranslate }] }]}>
+              <View style={styles.timelineThumbDot} />
+            </Animated.View>
+          </View>
+        </View>
+        <TouchableOpacity
+          activeOpacity={0.78}
+          disabled={selectedIndex >= items.length - 1}
+          onPress={() => stepTimeline(1)}
+          style={[styles.timelineStepButton, selectedIndex >= items.length - 1 && styles.timelineStepDisabled]}
+        >
+          <ChevronRight size={18} color={selectedIndex >= items.length - 1 ? C.line2 : C.primary} />
+        </TouchableOpacity>
+      </View>
+      <View style={styles.timelineFooter}>
+        <Text style={styles.timelineRangeText} numberOfLines={1}>{originalMonthLabel(start)}</Text>
+        <Text style={styles.timelineCurrentText} numberOfLines={1}>{originalMonthLabel(selected)}</Text>
+        <Text style={styles.timelineRangeText} numberOfLines={1}>{originalMonthLabel(end)}</Text>
+      </View>
+    </View>
+  );
+}
+
+function uniqueCleanValues(values = []) {
+  const seen = new Set();
+  return values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value) => {
+      const key = normalizeGroupName(value) || value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function compactList(values = [], empty = "-") {
+  const clean = uniqueCleanValues(values);
+  if (!clean.length) return empty;
+  if (clean.length <= 2) return clean.join(", ");
+  return `${clean.slice(0, 2).join(", ")} +${clean.length - 2}`;
+}
+
+function isGenericSummary(value = "") {
+  return /^(original file saved|ocr complete|replacement saved|retrying ocr|document indexed from ocr text)/i.test(String(value || "").trim());
+}
+
+function usefulSummaryForDoc(doc = {}) {
+  const text = cleanReadableText(doc.clinicalSummary || doc.summary || "");
+  if (!text || isGenericSummary(text)) return "";
+  return text;
+}
+
+function docHasExtractedText(doc = {}) {
+  return Boolean(structuredTextForDoc(doc));
+}
+
+function recordGroupIntelligence(group) {
+  const docs = [...(group?.docs || [])].sort((a, b) => visitSortDate(b) - visitSortDate(a));
+  const processedDocs = docs.filter((doc) => docHasExtractedText(doc) || doc.status === "ready");
+  const readyDocs = docs.filter((doc) => doc.status === "ready");
+  const reuploadDocs = docs.filter((doc) => isReuploadStatus(doc.status));
+  const processingDocs = docs.filter((doc) => isProcessingStatus(doc.status));
+  const confidenceValues = docs.map((doc) => doc.ocrConfidence).filter((value) => typeof value === "number");
+  const avgConfidence = confidenceValues.length
+    ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length
+    : undefined;
+  const summaryItems = docs.map(usefulSummaryForDoc).filter(Boolean);
+  const summaryText = cleanReadableText(summaryItems.map((text) => `- ${text.replace(/\n+/g, " ")}`).join("\n"));
+  const extractedText = cleanReadableText(docs
+    .map((doc, index) => {
+      const text = structuredTextForDoc(doc);
+      if (!text) return "";
+      const visit = displayDateLabel(doc.date, visitSortDate(doc));
+      const label = [visit && visit !== "-" ? visit : "", categoryFor(doc.category).label]
+        .filter(Boolean)
+        .join(" - ") || `Document ${index + 1}`;
+      return `## ${label}\n\n${text}`;
+    })
+    .filter(Boolean)
+    .join("\n\n"));
+
+  return {
+    docs,
+    processedDocs,
+    readyDocs,
+    reuploadDocs,
+    processingDocs,
+    avgConfidence,
+    summaryText,
+    extractedText,
+    hospitals: uniqueCleanValues(docs.map((doc) => doc.hospital)),
+    doctors: uniqueCleanValues(docs.map((doc) => doc.doctor)),
+    patients: uniqueCleanValues(docs.map((doc) => doc.patientName || doc.patient)),
+    categories: uniqueCleanValues(docs.map((doc) => categoryFor(doc.category).label)),
+    providers: uniqueCleanValues(docs.map((doc) => providerLabel(doc.ocrProvider)).filter((value) => value !== "-")),
+  };
+}
+
+function recordProgressCopy(intelligence) {
+  const total = intelligence.docs.length;
+  const ready = intelligence.readyDocs.length;
+  const processed = intelligence.processedDocs.length;
+  const reupload = intelligence.reuploadDocs.length;
+  const processing = intelligence.processingDocs.length;
+  if (!total) return "No documents";
+  if (reupload && processed) return `${processed} processed, ${reupload} need reupload`;
+  if (reupload) return `${reupload} need reupload`;
+  if (processing && processed) return `${processing} new upload${processing === 1 ? "" : "s"} processing`;
+  if (processing) return `${processing} upload${processing === 1 ? "" : "s"} processing`;
+  return `${ready || processed || total} processed`;
+}
+
+function recordGroupShareText(group, intelligence, lastVisit, dateRange) {
+  const lines = [
+    `${group?.label || "Medical record"} - Heault record`,
+    `Last visit: ${lastVisit}`,
+    `Date range: ${dateRange}`,
+    `Documents: ${intelligence.docs.length}`,
+    intelligence.hospitals.length ? `Hospital: ${compactList(intelligence.hospitals)}` : "",
+    intelligence.doctors.length ? `Doctor: ${compactList(intelligence.doctors)}` : "",
+    intelligence.patients.length ? `Patient: ${compactList(intelligence.patients)}` : "",
+    intelligence.summaryText ? `\nAI summary:\n${intelligence.summaryText}` : "",
+    intelligence.extractedText ? `\nClean extracted text:\n${intelligence.extractedText}` : "",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+async function shareRecordGroup(group, intelligence, lastVisit, dateRange) {
+  try {
+    await Share.share({
+      title: `${group?.label || "Heault"} record`,
+      message: recordGroupShareText(group, intelligence, lastVisit, dateRange),
+    });
+  } catch (error) {
+    Alert.alert("Share failed", error?.message || "Could not share this record.");
+  }
 }
 
 function RecordGroupDetail({ nav, app, params }) {
   const mode = params?.mode || "hospital";
   const group = useMemo(() => groupRecords(app.docs, "latest", mode).find((item) => item.key === params?.groupKey), [app.docs, mode, params?.groupKey]);
-  const originals = useMemo(() => originalPagesForDocs(group?.docs || []), [group]);
+  const originals = useMemo(
+    () => originalPagesForDocs(group?.docs || [], app.authToken).sort(compareOriginalUploadOrder),
+    [group, app.authToken]
+  );
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [zoom, setZoom] = useState(1);
-  const [rotation, setRotation] = useState(0);
+  const positionedTimelineRef = useRef("");
+  const [galleryWidth, setGalleryWidth] = useState(0);
+  const [fullGallery, setFullGallery] = useState(false);
+  const [fullZoom, setFullZoom] = useState(1);
+  const [fullRotation, setFullRotation] = useState(0);
+  const [extractedExpanded, setExtractedExpanded] = useState(false);
+  const galleryScrollRef = useRef(null);
+  const fullGalleryScrollRef = useRef(null);
   const selected = originals[Math.min(selectedIndex, Math.max(0, originals.length - 1))];
   const selectedDoc = selected?.doc;
-  const selectedIsImage = selected?.file?.mimeType?.startsWith("image/");
   const selectedNeedsReupload = isReuploadStatus(selectedDoc?.status);
+  const groupStatus = statusForDocs(group?.docs || []);
+  const dateRange = dateRangeForDocs(group?.docs || []);
+  const lastVisit = lastVisitForDocs(group?.docs || []);
+  const intelligence = useMemo(() => recordGroupIntelligence(group), [group]);
+  const groupTypeIcon = group?.type === "doctor" ? Stethoscope : group?.type === "patient" ? UserRound : group?.type === "period" ? CalendarClock : Building2;
+  const GroupIcon = groupTypeIcon;
+  const groupUploadTarget = useMemo(
+    () => normalizeUploadTarget({ type: group?.type, mode, label: group?.label, groupKey: group?.key }),
+    [group?.key, group?.label, group?.type, mode]
+  );
+  const previewWidth = galleryWidth || DEVICE_WIDTH - 68;
+  const overviewText = useMemo(() => buildRecordOverviewText(group, intelligence, lastVisit, dateRange), [group, intelligence, lastVisit, dateRange]);
+  const extractedText = intelligence.extractedText || "";
+  const extractedHasMore = extractedText.length > EXTRACTED_TEXT_PREVIEW_LIMIT;
+  const displayedExtractedText = extractedExpanded ? extractedText : truncateTextAtBoundary(extractedText);
 
   useEffect(() => {
     if (selectedIndex >= originals.length) setSelectedIndex(Math.max(0, originals.length - 1));
   }, [originals.length, selectedIndex]);
+
+  useEffect(() => {
+    setExtractedExpanded(false);
+  }, [params?.groupKey]);
+
+  useEffect(() => {
+    const key = `${params?.groupKey || "group"}:${originals.length}`;
+    if (!originals.length || positionedTimelineRef.current === key) return undefined;
+    positionedTimelineRef.current = key;
+    const latestIndex = 0;
+    setSelectedIndex(latestIndex);
+    const frame = requestAnimationFrame(() => {
+      galleryScrollRef.current?.scrollToIndex?.({ index: latestIndex, animated: false });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [params?.groupKey, originals.length, previewWidth]);
+
+  useEffect(() => {
+    if (!fullGallery) return undefined;
+    const frame = requestAnimationFrame(() => {
+      fullGalleryScrollRef.current?.scrollToIndex?.({ index: selectedIndex, animated: false });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [fullGallery, selectedIndex]);
+
+  const moveToOriginal = (index, options = {}) => {
+    const nextIndex = Math.max(0, Math.min(originals.length - 1, index));
+    setSelectedIndex(nextIndex);
+    const animated = options.animated ?? Math.abs(nextIndex - selectedIndex) <= 8;
+    galleryScrollRef.current?.scrollToIndex?.({ index: nextIndex, animated });
+  };
+
+  const openFullGallery = (index = selectedIndex) => {
+    if (!originals.length) return;
+    setSelectedIndex(Math.max(0, Math.min(originals.length - 1, index)));
+    setFullZoom(1);
+    setFullRotation(0);
+    setFullGallery(true);
+  };
 
   if (!group) {
     return (
@@ -1876,67 +2686,213 @@ function RecordGroupDetail({ nav, app, params }) {
     <Screen bottomPad={34}>
       <Header nav={nav} app={app} title="Record file" back />
       <View style={styles.pageBody}>
-        <View style={styles.groupDetailHeader}>
-          <View style={styles.recordGroupIcon}>
-            {(group.type === "doctor" ? <Stethoscope size={22} color={C.primary} /> : group.type === "patient" ? <UserRound size={22} color={C.primary} /> : <Building2 size={22} color={C.primary} />)}
+        <View style={styles.groupFileCover}>
+          <View style={styles.groupFileTab}>
+            <GroupIcon size={14} color={C.primary} />
+            <Text style={styles.groupFileTabText}>{groupLabelForMode(group.type)} file</Text>
           </View>
-          <View style={styles.flexFill}>
-            <Text style={styles.simplePageTitle} numberOfLines={2}>{group.label}</Text>
-            <Text style={styles.simplePageSubtitle}>{group.docs.length} documents - {group.pageCount} pages</Text>
+          <View style={styles.groupFileCoverTop}>
+            <View style={styles.recordGroupIcon}>
+              <GroupIcon size={22} color={C.primary} />
+            </View>
+            <View style={styles.flexFill}>
+              <Text style={styles.groupFileTitle} numberOfLines={2}>{group.label}</Text>
+              <Text style={styles.groupFileSubtitle} numberOfLines={1}>Last visit: {lastVisit}</Text>
+            </View>
+            {groupStatus === "needs_reupload" && <StatusPill status={groupStatus} />}
           </View>
+          <View style={styles.groupFileFacts}>
+            <View style={styles.groupFileFact}>
+              <Files size={14} color={C.primary} />
+              <Text style={styles.groupFileFactText}>{group.docs.length} doc{group.docs.length === 1 ? "" : "s"}</Text>
+            </View>
+            <View style={styles.groupFileFact}>
+              <FileText size={14} color={C.primary} />
+              <Text style={styles.groupFileFactText}>{group.pageCount} page{group.pageCount === 1 ? "" : "s"}</Text>
+            </View>
+            <View style={styles.groupFileFact}>
+              <CalendarClock size={14} color={C.primary} />
+              <Text style={styles.groupFileFactText} numberOfLines={1}>{lastVisit}</Text>
+            </View>
+          </View>
+          {!!groupUploadTarget && (
+            <TouchableOpacity
+              activeOpacity={0.84}
+              onPress={() => app.openUploadSheet?.(groupUploadTarget)}
+              style={styles.groupAddInlineButton}
+            >
+              <Plus size={17} color="#fff" />
+              <Text style={styles.groupAddInlineText}>
+                Add documents to this {groupUploadTarget.type === "hospital" ? "hospital" : "file"}
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
 
-        {!!originals.length && (
-          <Card style={styles.groupOriginalViewer}>
-            <View style={styles.groupViewerTop}>
-              <Text style={styles.groupViewerTitle}>Uploaded files</Text>
-              <Text style={styles.groupViewerCount}>{Math.min(selectedIndex + 1, originals.length)} / {originals.length}</Text>
+        <View style={styles.groupOriginalViewer}>
+          <View style={styles.groupViewerTop}>
+            <View>
+              <Text style={styles.groupViewerTitle}>Original documents</Text>
+              <Text style={styles.groupViewerSubtitle}>Every uploaded image or PDF stays here.</Text>
             </View>
-            <View style={styles.groupPreviewStage}>
-              <Animated.View style={{ transform: [{ scale: zoom }, { rotate: `${rotation}deg` }] }}>
-                {selectedIsImage ? (
-                  <Image source={{ uri: selected.file.uri }} style={styles.groupPreviewImage} resizeMode="contain" />
-                ) : (
-                  <View style={styles.groupPdfPreview}>
-                    <FileText size={36} color={C.primary} />
-                    <Text style={styles.groupPdfTitle} numberOfLines={2}>{selected?.file?.name || selected?.doc?.fileName || "PDF document"}</Text>
-                  </View>
-                )}
-              </Animated.View>
-            </View>
-            {!!selectedDoc && (
-              <View style={styles.groupSelectedMeta}>
-                <View style={styles.flexFill}>
-                  <Text style={styles.groupSelectedTitle} numberOfLines={1}>{selectedDoc.title || selectedDoc.fileName || "Uploaded file"}</Text>
-                  <Text style={styles.groupSelectedSub} numberOfLines={1}>{selected?.file?.name || selectedDoc.fileName || "Original saved locally"}</Text>
-                </View>
-                <StatusPill status={selectedDoc.status || "ready"} />
+            <Text style={styles.groupViewerCount}>
+              {originals.length ? `${Math.min(selectedIndex + 1, originals.length)} / ${originals.length}` : "Not cached"}
+            </Text>
+          </View>
+          <View style={styles.groupPreviewStage} onLayout={(event) => setGalleryWidth(event.nativeEvent.layout.width)}>
+            {originals.length ? (
+              <>
+                <FlatList
+                  ref={galleryScrollRef}
+                  data={originals}
+                  horizontal
+                  pagingEnabled
+                  initialNumToRender={1}
+                  maxToRenderPerBatch={2}
+                  windowSize={3}
+                  removeClippedSubviews
+                  showsHorizontalScrollIndicator={false}
+                  keyExtractor={(item, index) => `${item.doc.id}-${item.index}-${index}`}
+                  getItemLayout={(_, index) => ({ length: previewWidth, offset: previewWidth * index, index })}
+                  onScrollToIndexFailed={(info) => {
+                    galleryScrollRef.current?.scrollToOffset?.({ offset: info.averageItemLength * info.index, animated: true });
+                  }}
+                  onMomentumScrollEnd={(event) => {
+                    const index = Math.round(event.nativeEvent.contentOffset.x / Math.max(1, previewWidth));
+                    setSelectedIndex(Math.max(0, Math.min(originals.length - 1, index)));
+                  }}
+                  renderItem={({ item, index }) => (
+                    <TouchableOpacity key={`${item.doc.id}-${index}`} activeOpacity={0.94} onPress={() => openFullGallery(index)}>
+                      <OriginalPreviewPage item={item} width={previewWidth} />
+                    </TouchableOpacity>
+                  )}
+                />
+                <TouchableOpacity activeOpacity={0.82} onPress={() => openFullGallery(selectedIndex)} style={styles.galleryOpenButton}>
+                  <Maximize2 size={15} color="#fff" />
+                  <Text style={styles.galleryOpenText}>Open</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <View style={styles.groupMissingOriginal}>
+                <FileText size={38} color="#fff" />
+                <Text style={styles.groupMissingTitle}>Original preview is not cached on this device</Text>
+                <Text style={styles.groupMissingText}>Metadata, OCR text, and summary are still available. Reupload the file to restore the original preview.</Text>
               </View>
             )}
-            <View style={styles.viewerTools}>
-              <ViewerTool icon={ChevronLeft} onPress={() => setSelectedIndex((index) => Math.max(0, index - 1))} />
-              <ViewerTool icon={ChevronRight} onPress={() => setSelectedIndex((index) => Math.min(originals.length - 1, index + 1))} />
-              <ViewerTool icon={ZoomOut} onPress={() => setZoom((z) => Math.max(0.8, z - 0.1))} />
-              <ViewerTool icon={ZoomIn} onPress={() => setZoom((z) => Math.min(1.45, z + 0.1))} />
-              <ViewerTool icon={RotateCw} onPress={() => setRotation((r) => r + 90)} />
+          </View>
+          {!!originals.length && <TimelineScrubber items={originals} selectedIndex={selectedIndex} onChange={moveToOriginal} />}
+          {selectedNeedsReupload && (
+            <AppButton icon={RefreshCcw} onPress={() => app.reuploadDoc?.(selectedDoc.id)} style={[styles.fullWidth, { marginTop: 14 }]}>
+              Reupload this file
+            </AppButton>
+          )}
+        </View>
+
+        {!!(intelligence.processingDocs.length || intelligence.reuploadDocs.length) && (
+          <Card style={[styles.recordProcessCard, intelligence.reuploadDocs.length ? styles.recordProcessCardWarn : styles.recordProcessCardInfo]}>
+            <View style={styles.recordProcessIcon}>
+              {intelligence.reuploadDocs.length ? <RefreshCcw size={18} color={C.amber} /> : <ActivityIndicator size="small" color={C.blue} />}
             </View>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.groupThumbRow}>
-              {originals.map((item, index) => {
-                const isImage = item.file?.mimeType?.startsWith("image/");
-                return (
-                  <TouchableOpacity key={`${item.doc.id}-${index}`} activeOpacity={0.78} onPress={() => setSelectedIndex(index)} style={[styles.groupThumb, selectedIndex === index && styles.groupThumbActive]}>
-                    {isImage ? <Image source={{ uri: item.file.uri }} style={styles.groupThumbImage} resizeMode="cover" /> : <FileText size={24} color={C.primary} />}
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-            {selectedNeedsReupload && (
-              <AppButton icon={RefreshCcw} onPress={() => app.reuploadDoc?.(selectedDoc.id)} style={[styles.fullWidth, { marginTop: 14 }]}>
-                Reupload this file
-              </AppButton>
-            )}
+            <View style={styles.flexFill}>
+              <Text style={styles.recordProcessTitle}>{recordProgressCopy(intelligence)}</Text>
+              <Text style={styles.recordProcessText}>
+                Existing pages stay saved. Heault processes only the newly added uploads and then adds them to this file.
+              </Text>
+            </View>
           </Card>
         )}
+
+        <Card style={styles.recordSummaryPanel}>
+          <View style={styles.sectionHeaderSpread}>
+            <View style={styles.insightPanelHeader}>
+              <FileCheck2 size={17} color={C.primary} />
+              <Text style={styles.ocrTitle}>Record summary</Text>
+            </View>
+            <TouchableOpacity activeOpacity={0.78} onPress={() => shareRecordGroup(group, intelligence, lastVisit, dateRange)} style={styles.sectionActionButton}>
+              <Share2 size={15} color={C.primary} />
+            </TouchableOpacity>
+          </View>
+          <View style={styles.recordSummaryGrid}>
+            <View style={styles.recordSummaryTile}>
+              <CalendarClock size={16} color={C.primary} />
+              <Text style={styles.recordSummaryLabel}>Last visit</Text>
+              <Text style={styles.recordSummaryValue} numberOfLines={1}>{lastVisit}</Text>
+            </View>
+            <View style={styles.recordSummaryTile}>
+              <Files size={16} color={C.primary} />
+              <Text style={styles.recordSummaryLabel}>Documents</Text>
+              <Text style={styles.recordSummaryValue}>{group.docs.length} / {group.pageCount} pages</Text>
+            </View>
+          </View>
+          <InfoRow label="Hospital" value={group.type === "hospital" && group.label !== "Hospital not found" ? group.label : compactList(intelligence.hospitals)} />
+          <InfoRow label="Doctor" value={compactList(intelligence.doctors)} />
+          <InfoRow label="Patient" value={compactList(intelligence.patients)} />
+          <InfoRow label="Categories" value={compactList(intelligence.categories)} />
+          <InfoRow label="OCR confidence" value={percentLabel(intelligence.avgConfidence)} />
+          <InfoRow label="OCR provider" value={compactList(intelligence.providers)} />
+        </Card>
+
+        <Card style={[styles.infoPanel, styles.groupAiPanel]}>
+          <View style={styles.insightPanelHeader}>
+            <Sparkles size={17} color={C.green} />
+            <Text style={styles.ocrTitle}>AI summary</Text>
+          </View>
+          {overviewText ? (
+            <>
+              <ReportText text={overviewText} large />
+              {!!intelligence.reuploadDocs.length && (
+                <Text style={styles.sectionFootnote}>Summary uses processed pages only. Reupload unclear pages to complete this record.</Text>
+              )}
+            </>
+          ) : intelligence.processingDocs.length ? (
+            <View style={styles.sectionLoadingRow}>
+              <ActivityIndicator size="small" color={C.green} />
+              <Text style={styles.sectionMutedText}>Analyzing documents. This will update automatically when processing finishes.</Text>
+            </View>
+          ) : (
+            <Text style={styles.sectionMutedText}>AI summary will appear after OCR and analysis finish.</Text>
+          )}
+        </Card>
+
+        <Card style={styles.infoPanel}>
+          <View style={styles.sectionHeaderSpread}>
+            <View style={styles.insightPanelHeader}>
+              <FileText size={17} color={C.blue} />
+              <Text style={styles.ocrTitle}>Clean extracted text</Text>
+            </View>
+            <View style={styles.sectionActions}>
+              <TouchableOpacity activeOpacity={0.78} onPress={() => shareRecordGroup(group, intelligence, lastVisit, dateRange)} style={styles.sectionActionButton}>
+                <Share2 size={15} color={C.primary} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                activeOpacity={0.78}
+                disabled={!selectedDoc}
+                onPress={() => selectedDoc && nav.push("ocrReview", { docId: selectedDoc.id })}
+                style={[styles.sectionActionButton, !selectedDoc && styles.sectionActionButtonDisabled]}
+              >
+                <Edit3 size={15} color={selectedDoc ? C.primary : C.muted} />
+              </TouchableOpacity>
+            </View>
+          </View>
+          {extractedText ? (
+            <>
+              <ReportText text={displayedExtractedText} />
+              {extractedHasMore && (
+                <TouchableOpacity activeOpacity={0.78} onPress={() => setExtractedExpanded((value) => !value)} style={styles.readMoreButton}>
+                  <Text style={styles.readMoreText}>{extractedExpanded ? "Show less" : "Read more"}</Text>
+                  <ChevronRight size={15} color={C.primary} style={{ transform: [{ rotate: extractedExpanded ? "-90deg" : "90deg" }] }} />
+                </TouchableOpacity>
+              )}
+            </>
+          ) : intelligence.processingDocs.length ? (
+            <View style={styles.sectionLoadingRow}>
+              <ActivityIndicator size="small" color={C.blue} />
+              <Text style={styles.sectionMutedText}>Extracting readable text from the uploaded documents.</Text>
+            </View>
+          ) : (
+            <Text style={styles.sectionMutedText}>No readable text is available yet. Reupload a clearer medical document if this remains empty.</Text>
+          )}
+        </Card>
 
         <Card style={styles.infoPanel}>
           <View style={styles.insightPanelHeader}>
@@ -1944,18 +2900,53 @@ function RecordGroupDetail({ nav, app, params }) {
             <Text style={styles.ocrTitle}>File details</Text>
           </View>
           <InfoRow label="Grouped by" value={groupLabelForMode(group.type)} />
-          <InfoRow label="Latest upload" value={group.docs[0]?.date} />
-          <InfoRow label="Categories" value={group.categoryLabels.join(", ")} />
-          <InfoRow label="Status" value={group.docs.some((doc) => isReuploadStatus(doc.status)) ? "Reupload needed" : group.docs.some((doc) => isProcessingStatus(doc.status)) ? "Processing" : "Ready"} />
+          <InfoRow label="Date range" value={dateRange} />
+          <InfoRow label="Documents" value={`${group.docs.length} document${group.docs.length === 1 ? "" : "s"}`} />
+          <InfoRow label="Pages" value={`${group.pageCount} page${group.pageCount === 1 ? "" : "s"}`} />
+          <InfoRow label="Status" value={statusCopy(groupStatus)[0]} />
         </Card>
-
-        <SectionTitle text="Documents" />
-        <View style={styles.groupDocsList}>
-          {group.docs.map((doc) => (
-            <EnterpriseRecordCard key={doc.id} doc={doc} onPress={() => openDocument(nav, doc)} />
-          ))}
-        </View>
       </View>
+      <Modal visible={fullGallery} transparent animationType="fade" onRequestClose={() => setFullGallery(false)}>
+        <View style={styles.galleryModal}>
+          <View style={styles.galleryModalTop}>
+            <TouchableOpacity activeOpacity={0.8} onPress={() => setFullGallery(false)} style={styles.galleryTopButton}>
+              <X size={20} color="#fff" />
+            </TouchableOpacity>
+            <Text style={styles.galleryCounter}>{originals.length ? `${selectedIndex + 1} / ${originals.length}` : "0 / 0"}</Text>
+            <TouchableOpacity activeOpacity={0.8} onPress={() => selectedDoc && shareDocument(selectedDoc)} style={styles.galleryTopButton}>
+              <Share2 size={19} color="#fff" />
+            </TouchableOpacity>
+          </View>
+          <FlatList
+            ref={fullGalleryScrollRef}
+            data={originals}
+            horizontal
+            pagingEnabled
+            initialNumToRender={1}
+            maxToRenderPerBatch={2}
+            windowSize={3}
+            removeClippedSubviews
+            showsHorizontalScrollIndicator={false}
+            keyExtractor={(item, index) => `${item.doc.id}-full-${item.index}-${index}`}
+            getItemLayout={(_, index) => ({ length: DEVICE_WIDTH, offset: DEVICE_WIDTH * index, index })}
+            onScrollToIndexFailed={(info) => {
+              fullGalleryScrollRef.current?.scrollToOffset?.({ offset: DEVICE_WIDTH * info.index, animated: true });
+            }}
+            onMomentumScrollEnd={(event) => {
+              const index = Math.round(event.nativeEvent.contentOffset.x / DEVICE_WIDTH);
+              setSelectedIndex(Math.max(0, Math.min(originals.length - 1, index)));
+            }}
+            renderItem={({ item, index }) => (
+              <OriginalPreviewPage key={`${item.doc.id}-full-${index}`} item={item} width={DEVICE_WIDTH} full zoom={index === selectedIndex ? fullZoom : 1} rotation={index === selectedIndex ? fullRotation : 0} />
+            )}
+          />
+          <View style={styles.galleryModalTools}>
+            <ViewerTool icon={ZoomOut} onPress={() => setFullZoom((z) => Math.max(0.8, z - 0.12))} />
+            <ViewerTool icon={ZoomIn} onPress={() => setFullZoom((z) => Math.min(1.8, z + 0.12))} />
+            <ViewerTool icon={RotateCw} onPress={() => setFullRotation((r) => r + 90)} />
+          </View>
+        </View>
+      </Modal>
     </Screen>
   );
 }
@@ -2179,52 +3170,49 @@ function UploadPreview({ nav, app, params }) {
     pdf: ["Upload PDF", "PDF selected"],
   }[method];
   const isImageDoc = doc?.mimeType?.startsWith("image/");
+  const isPdfDoc = isPdfMime(doc?.mimeType, doc?.fileName);
 
   return (
     <Screen bottomPad={34}>
-      <Header nav={nav} app={app} title={copy[0]} back />
+      <Header nav={nav} app={app} title="Import document" back />
       <View style={styles.pageBody}>
         <Card style={styles.uploadStatusCard}>
           <View style={styles.uploadStatusIcon}>
             <ShieldCheck size={20} color={C.green} />
           </View>
           <View style={styles.flexFill}>
-            <Text style={styles.uploadStatusTitle}>Original file saved locally</Text>
-            <Text style={styles.uploadStatusText} numberOfLines={2}>{doc?.fileName || "The selected file is protected before OCR starts."}</Text>
+            <Text style={styles.uploadStatusTitle}>{copy[0]}</Text>
+            <Text style={styles.uploadStatusText} numberOfLines={2}>Original saved locally before OCR or AI starts.</Text>
           </View>
           <StatusPill status={doc?.status || "queued"} />
         </Card>
 
-        <Card style={[styles.previewCard, method === "camera" && { backgroundColor: "#171316" }]}>
+        <View style={[styles.previewCard, method === "camera" && { backgroundColor: "#171316" }]}>
           {doc && isImageDoc ? (
             <Image source={{ uri: doc.localUri }} style={styles.originalImagePreview} resizeMode="contain" />
-          ) : method === "pdf" ? (
-            <View style={styles.pdfPreviewPanel}>
-              <FileText size={42} color={C.primary} />
-              <Text style={styles.pdfPreviewTitle} numberOfLines={2}>{doc?.fileName || "PDF document"}</Text>
-              <Text style={styles.pdfPreviewSub}>Embedded text will be extracted when available.</Text>
-            </View>
+          ) : doc && isPdfDoc ? (
+            <PdfPreview uri={doc.localUri} />
           ) : (
             <View>
               <DocumentMock />
               {method === "camera" && <View style={styles.scanLine} />}
             </View>
           )}
-        </Card>
+        </View>
         <View style={styles.toolGrid}>
           <ToolButton icon={RefreshCcw} label={method === "camera" ? "Retake" : "Replace"} />
           <ToolButton icon={Crop} label="Crop" />
           <ToolButton icon={RotateCw} label="Rotate" />
           <ToolButton icon={Sparkles} label="Enhance" active={enhanced} onPress={() => setEnhanced(!enhanced)} />
         </View>
-        <Card style={[styles.readyCard, { backgroundColor: C.greenSoft }]}>
+        <Card style={styles.readyCard}>
           <Check size={18} color={C.green} />
           <View style={styles.flexFill}>
             <Text style={styles.readyTitle}>{copy[1]}</Text>
-            <Text style={styles.readySubtitle}>Ready for backend OCR and AI categorization</Text>
+            <Text style={styles.readySubtitle}>We will read the document, group it, and keep the original unchanged.</Text>
           </View>
         </Card>
-        <AppButton disabled={!doc} icon={Sparkles} onPress={() => nav.push("analysis", { method, docId: doc?.id })} style={[styles.fullWidth, { marginTop: 18 }]}>Run OCR + AI</AppButton>
+        <AppButton disabled={!doc} icon={Sparkles} onPress={() => nav.push("analysis", { method, docId: doc?.id })} style={[styles.fullWidth, { marginTop: 18 }]}>Start processing</AppButton>
       </View>
     </Screen>
   );
@@ -2301,6 +3289,7 @@ function AnalysisScreen({ nav, app, params }) {
   const done = currentDoc?.status === "ready" || isReuploadStatus(currentDoc?.status) || progress >= 100;
   const needsReupload = isReuploadStatus(currentDoc?.status);
   const isImageDoc = currentDoc?.mimeType?.startsWith("image/");
+  const isPdfDoc = isPdfMime(currentDoc?.mimeType, currentDoc?.fileName);
   const retryProcessing = () => {
     if (!currentDoc) return;
     startedRef.current = false;
@@ -2340,10 +3329,6 @@ function AnalysisScreen({ nav, app, params }) {
     <Screen bottomPad={34}>
       <Header nav={nav} app={app} title="Processing" back />
       <View style={styles.pageBody}>
-        <View style={styles.simplePageHeader}>
-          <Text style={styles.simplePageTitle}>Extract document data</Text>
-          <Text style={styles.simplePageSubtitle}>OCR reads the file first. AI then summarizes and categorizes it.</Text>
-        </View>
         <Card style={styles.analysisHeroCard}>
           <View style={styles.analysisHeroTop}>
             <View style={styles.analysisCrossWrap}>
@@ -2354,6 +3339,10 @@ function AnalysisScreen({ nav, app, params }) {
               <Text style={styles.analysisBody} numberOfLines={2}>{currentDoc.title}</Text>
             </View>
             {!done && <ActivityIndicator color={C.primary} />}
+          </View>
+          <View style={styles.analysisSavedRow}>
+            <Lock size={14} color={C.green} />
+            <Text style={styles.analysisSavedText}>Original file saved locally. Processing can fail without losing the upload.</Text>
           </View>
           <ExtractionAnimation active={!done} progress={progress} />
           <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${progress}%` }]} /></View>
@@ -2376,7 +3365,13 @@ function AnalysisScreen({ nav, app, params }) {
             </View>
           </View>
           <View style={styles.originalPreview}>
-            {isImageDoc ? <Image source={{ uri: currentDoc.localUri }} style={styles.originalImagePreview} resizeMode="contain" /> : <DocumentMock />}
+            {isImageDoc ? (
+              <Image source={{ uri: currentDoc.localUri }} style={styles.originalImagePreview} resizeMode="contain" />
+            ) : isPdfDoc ? (
+              <PdfPreview uri={currentDoc.localUri} compact />
+            ) : (
+              <DocumentMock />
+            )}
           </View>
         </Card>
 
@@ -2577,19 +3572,21 @@ function OCRReview({ nav, app, params }) {
           <Sparkles size={18} color={isReuploadStatus(incoming?.status) ? C.red : C.green} />
           <Text style={styles.ocrBannerText}>{isReuploadStatus(incoming?.status) ? "Reupload needed. Original file is saved." : "OCR text and metadata are ready for correction."}</Text>
         </Card>
-        <Field label="Rename document" value={form.title} onChangeText={(title) => setForm({ ...form, title })} icon={FileText} />
-        <Text style={styles.fieldLabel}>Category</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={[styles.chipRow, { marginTop: 8 }]}>
-          {CATEGORIES.map((cat) => <Chip key={cat.id} label={cat.label} active={form.category === cat.id} onPress={() => setForm({ ...form, category: cat.id })} />)}
-        </ScrollView>
-        <Field label="AI summary" value={form.summary} onChangeText={(summary) => setForm({ ...form, summary })} icon={Sparkles} multiline />
-        <Field label="Tags" value={form.tags} onChangeText={(tags) => setForm({ ...form, tags })} icon={Tags} />
-        <Field label="Hospital name" value={form.hospital} onChangeText={(hospital) => setForm({ ...form, hospital })} icon={Building2} />
-        <Field label="Doctor name" value={form.doctor} onChangeText={(doctor) => setForm({ ...form, doctor })} icon={Stethoscope} />
-        <Field label="Visit date" value={form.visitDate} onChangeText={(visitDate) => setForm({ ...form, visitDate })} icon={CalendarClock} />
-        <Field label="Clean extracted text" value={form.structuredText} onChangeText={(structuredText) => setForm({ ...form, structuredText })} icon={FileCheck2} multiline />
-        <Field label="Raw OCR text" value={form.ocr} onChangeText={(ocr) => setForm({ ...form, ocr })} icon={FileText} multiline />
-        <AppButton icon={ShieldCheck} onPress={save} style={styles.fullWidth}>{incoming ? "Save changes" : "Save document"}</AppButton>
+        <Card style={styles.formPanel}>
+          <Field label="Rename document" value={form.title} onChangeText={(title) => setForm({ ...form, title })} icon={FileText} />
+          <Text style={styles.fieldLabel}>Category</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={[styles.chipRow, { marginTop: 8, marginBottom: 14 }]}>
+            {CATEGORIES.map((cat) => <Chip key={cat.id} label={cat.label} active={form.category === cat.id} onPress={() => setForm({ ...form, category: cat.id })} />)}
+          </ScrollView>
+          <Field label="AI summary" value={form.summary} onChangeText={(summary) => setForm({ ...form, summary })} icon={Sparkles} multiline />
+          <Field label="Tags" value={form.tags} onChangeText={(tags) => setForm({ ...form, tags })} icon={Tags} />
+          <Field label="Hospital name" value={form.hospital} onChangeText={(hospital) => setForm({ ...form, hospital })} icon={Building2} />
+          <Field label="Doctor name" value={form.doctor} onChangeText={(doctor) => setForm({ ...form, doctor })} icon={Stethoscope} />
+          <Field label="Visit date" value={form.visitDate} onChangeText={(visitDate) => setForm({ ...form, visitDate })} icon={CalendarClock} />
+          <Field label="Clean extracted text" value={form.structuredText} onChangeText={(structuredText) => setForm({ ...form, structuredText })} icon={FileCheck2} multiline />
+          <Field label="Raw OCR text" value={form.ocr} onChangeText={(ocr) => setForm({ ...form, ocr })} icon={FileText} multiline />
+        </Card>
+        <AppButton icon={ShieldCheck} onPress={save} style={[styles.fullWidth, { marginTop: 16 }]}>{incoming ? "Save changes" : "Save document"}</AppButton>
       </View>
     </Screen>
   );
@@ -2602,7 +3599,9 @@ function DocumentDetail({ nav, app, params }) {
   const [zoom, setZoom] = useState(1);
   const [rotation, setRotation] = useState(0);
   const [full, setFull] = useState(false);
-  const isImageDoc = doc?.mimeType?.startsWith("image/");
+  const originalFile = primaryOriginalForDoc(doc, app.authToken);
+  const isImageDoc = originalFile?.mimeType?.startsWith("image/");
+  const isPdfDoc = isPdfMime(originalFile?.mimeType, originalFile?.name || doc?.fileName);
   const summaryText = doc?.summary || doc?.clinicalSummary || "";
   const structuredText = structuredTextForDoc(doc);
 
@@ -2610,11 +3609,28 @@ function DocumentDetail({ nav, app, params }) {
     <Screen bottomPad={34}>
       <Header nav={nav} app={app} title="Document" back right={<IconButton icon={MoreHorizontal} label="More" />} />
       <View style={styles.pageBody}>
-        <Card style={styles.documentViewer}>
-          <Animated.View style={{ transform: [{ scale: zoom }, { rotate: `${rotation}deg` }] }}>
-            {isImageDoc ? <Image source={{ uri: doc.localUri }} style={styles.viewerImagePreview} resizeMode="contain" /> : <DocumentMock />}
-          </Animated.View>
-        </Card>
+        <View style={styles.documentViewerShell}>
+          <View style={styles.documentViewerTop}>
+            <View>
+              <Text style={styles.documentViewerLabel}>Original file</Text>
+              <Text style={styles.documentViewerName} numberOfLines={1}>{doc.fileName || doc.title}</Text>
+            </View>
+            <StatusPill status={doc.status || "ready"} />
+          </View>
+          <View style={styles.documentViewer}>
+            {isPdfDoc ? (
+              <PdfPreview uri={originalFile?.uri} headers={originalFile?.headers} />
+            ) : (
+              <Animated.View style={{ transform: [{ scale: zoom }, { rotate: `${rotation}deg` }] }}>
+                {isImageDoc ? (
+                <Image source={sourceForOriginalFile(originalFile)} style={styles.viewerImagePreview} resizeMode="contain" />
+                ) : (
+                  <DocumentMock />
+                )}
+              </Animated.View>
+            )}
+          </View>
+        </View>
         <View style={styles.viewerTools}>
           <ViewerTool icon={ZoomOut} onPress={() => setZoom((z) => Math.max(0.8, z - 0.1))} />
           <ViewerTool icon={ZoomIn} onPress={() => setZoom((z) => Math.min(1.35, z + 0.1))} />
@@ -2628,9 +3644,8 @@ function DocumentDetail({ nav, app, params }) {
           </View>
           <View style={styles.flexFill}>
             <Text style={styles.detailTitle} numberOfLines={1}>{doc.title}</Text>
-            <Text style={styles.detailSubtitle}>{cat.label} - {doc.pages} pages</Text>
+            <Text style={styles.detailSubtitle}>{cat.label} - {doc.pages} page{doc.pages === 1 ? "" : "s"}</Text>
           </View>
-          <StatusPill status={doc.status || "ready"} />
         </View>
         <Card style={styles.infoPanel}>
           <View style={styles.insightPanelHeader}>
@@ -2673,7 +3688,13 @@ function DocumentDetail({ nav, app, params }) {
       <Modal visible={full} transparent animationType="fade" onRequestClose={() => setFull(false)}>
         <View style={styles.fullPreview}>
           <TouchableOpacity activeOpacity={0.8} onPress={() => setFull(false)} style={styles.fullClose}><X size={20} color={C.primary} /></TouchableOpacity>
-          {isImageDoc ? <Image source={{ uri: doc.localUri }} style={styles.fullPreviewImage} resizeMode="contain" /> : <DocumentMock />}
+          {isImageDoc ? (
+            <Image source={sourceForOriginalFile(originalFile)} style={styles.fullPreviewImage} resizeMode="contain" />
+          ) : isPdfDoc ? (
+            <PdfPreview uri={originalFile?.uri} headers={originalFile?.headers} full />
+          ) : (
+            <DocumentMock />
+          )}
         </View>
       </Modal>
     </Screen>
@@ -2723,7 +3744,7 @@ function ReportTable({ rows }) {
   );
 }
 
-function ReportText({ text }) {
+function ReportText({ text, large = false }) {
   const blocks = cleanReadableText(text).split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
   if (!blocks.length) return null;
 
@@ -2743,18 +3764,18 @@ function ReportText({ text }) {
             {lines.map((line, lineIndex) => {
               const heading = line.match(/^(#{1,6})\s+(.+)/);
               if (heading) {
-                return <Text key={`line-${lineIndex}`} style={styles.reportHeading}>{heading[2]}</Text>;
+                return <Text key={`line-${lineIndex}`} style={[styles.reportHeading, large && styles.reportHeadingLarge]}>{heading[2]}</Text>;
               }
               const bullet = line.match(/^\s*[-*]\s+(.+)/);
               if (bullet) {
                 return (
                   <View key={`line-${lineIndex}`} style={styles.reportBulletRow}>
                     <View style={styles.reportBulletDot} />
-                    <Text style={styles.reportText}>{bullet[1]}</Text>
+                    <Text style={[styles.reportText, large && styles.reportTextLarge]}>{bullet[1]}</Text>
                   </View>
                 );
               }
-              return <Text key={`line-${lineIndex}`} style={styles.reportText}>{stripInlineHtml(line)}</Text>;
+              return <Text key={`line-${lineIndex}`} style={[styles.reportText, large && styles.reportTextLarge]}>{stripInlineHtml(line)}</Text>;
             })}
           </View>
         );
@@ -2927,7 +3948,7 @@ function ListAction({ icon: Icon, title, subtitle, danger, onPress }) {
   );
 }
 
-function BottomNav({ current, nav, fabOpen, setFabOpen, onUpload }) {
+function BottomNav({ current, nav, fabOpen, setFabOpen, reuploadTargetId, setReuploadTargetId, uploadContext, setUploadContext, onUpload, onReupload, showBar = true }) {
   const options = [
     { id: "camera", icon: Camera, label: "Scan with Camera", sub: "Convert physical papers to digital data", tone: C.primary },
     { id: "pdf", icon: FileText, label: "Upload PDF", sub: "Direct import from medical portals", tone: C.primary2 },
@@ -2935,16 +3956,39 @@ function BottomNav({ current, nav, fabOpen, setFabOpen, onUpload }) {
   ];
   const openUpload = async (method) => {
     setFabOpen(false);
-    await onUpload?.(method);
+    const targetId = reuploadTargetId;
+    const targetContext = uploadContext;
+    setReuploadTargetId?.("");
+    setUploadContext?.(null);
+    if (targetId) await onReupload?.(targetId, method);
+    else await onUpload?.(method, targetContext);
   };
+  const closeSheet = () => {
+    setFabOpen(false);
+    setReuploadTargetId?.("");
+    setUploadContext?.(null);
+  };
+  const replaceMode = Boolean(reuploadTargetId);
+  const targetMode = Boolean(!replaceMode && uploadContext?.label);
+  const targetLabel = uploadContext?.type === "hospital"
+    ? "hospital file"
+    : uploadContext?.type === "doctor"
+      ? "doctor file"
+      : "record file";
   return (
     <>
-      <Modal visible={fabOpen} transparent animationType="fade" onRequestClose={() => setFabOpen(false)}>
-        <TouchableOpacity activeOpacity={1} onPress={() => setFabOpen(false)} style={styles.sheetScrim}>
+      <Modal visible={fabOpen} transparent animationType="slide" onRequestClose={closeSheet}>
+        <TouchableOpacity activeOpacity={1} onPress={closeSheet} style={styles.sheetScrim}>
           <TouchableOpacity activeOpacity={1} style={styles.uploadSheet}>
             <View style={styles.sheetGrabber} />
-            <Text style={styles.sheetTitle}>Add New Record</Text>
-            <Text style={styles.sheetSubtitle}>Choose how you would like to import your medical documents.</Text>
+            <Text style={styles.sheetTitle}>{replaceMode ? "Replace Original" : targetMode ? `Add to ${targetLabel}` : "Add New Record"}</Text>
+            <Text style={styles.sheetSubtitle}>
+              {replaceMode
+                ? "Choose the replacement source for this file."
+                : targetMode
+                  ? uploadContext.label
+                  : "Choose how you would like to import your medical documents."}
+            </Text>
             <View style={styles.sheetOptions}>
               {options.map((item, index) => {
                 const Icon = item.icon;
@@ -2963,17 +4007,26 @@ function BottomNav({ current, nav, fabOpen, setFabOpen, onUpload }) {
                 );
               })}
             </View>
-            <AppButton tone="danger" onPress={() => setFabOpen(false)} style={[styles.fullWidth, { marginTop: 22 }]}>Cancel</AppButton>
+            <AppButton tone="danger" onPress={closeSheet} style={[styles.fullWidth, { marginTop: 22 }]}>Cancel</AppButton>
           </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
-      <View style={styles.bottomNav}>
-        <NavItem icon={Home} label="Home" active={current === "home"} onPress={() => { setFabOpen(false); nav.go("home"); }} />
-        <TouchableOpacity accessibilityLabel="Upload" activeOpacity={0.82} onPress={() => setFabOpen(!fabOpen)} style={styles.navFab}>
+      {showBar && <View style={styles.bottomNav}>
+        <NavItem icon={Home} label="Home" active={current === "home"} onPress={() => { closeSheet(); nav.go("home"); }} />
+        <TouchableOpacity
+          accessibilityLabel="Upload"
+          activeOpacity={0.82}
+          onPress={() => {
+            setReuploadTargetId?.("");
+            setUploadContext?.(null);
+            setFabOpen(!fabOpen);
+          }}
+          style={styles.navFab}
+        >
           <Plus size={30} color="#fff" style={{ transform: [{ rotate: fabOpen ? "45deg" : "0deg" }] }} />
         </TouchableOpacity>
-        <NavItem icon={FolderOpen} label="Records" active={current === "records"} onPress={() => { setFabOpen(false); nav.go("records"); }} />
-      </View>
+        <NavItem icon={FolderOpen} label="Records" active={current === "records"} onPress={() => { closeSheet(); nav.go("records"); }} />
+      </View>}
     </>
   );
 }
@@ -2994,6 +4047,8 @@ const ROOT_SCREENS = ["home", "records"];
 export default function App() {
   const [stack, setStack] = useState([{ screen: "splash" }]);
   const [fabOpen, setFabOpen] = useState(false);
+  const [reuploadTargetId, setReuploadTargetId] = useState("");
+  const [uploadContext, setUploadContext] = useState(null);
   const [user, setUser] = useState(initialUser);
   const [docs, setDocs] = useState([]);
   const [authToken, setAuthToken] = useState("");
@@ -3065,29 +4120,48 @@ export default function App() {
   const pop = useCallback(() => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s)), []);
   const go = useCallback((screen, params) => {
     setFabOpen(false);
+    setReuploadTargetId("");
+    setUploadContext(null);
     setStack([{ screen, params }]);
   }, []);
-  const startUpload = useCallback(async (method) => {
+  const openUploadSheet = useCallback((context = null) => {
+    setReuploadTargetId("");
+    setUploadContext(normalizeUploadTarget(context));
+    setFabOpen(true);
+  }, []);
+  const openReuploadSheet = useCallback((docId) => {
+    if (!docId) return;
+    setReuploadTargetId(docId);
+    setUploadContext(null);
+    setFabOpen(true);
+  }, []);
+  const startUpload = useCallback(async (method, context = null) => {
     if (!authToken) {
       Alert.alert("Login required", "Please login or create an account before uploading medical documents.");
       go("welcome");
       return;
     }
     try {
+      const uploadTarget = normalizeUploadTarget(context);
       const assets = await pickUploadAssets(method);
       if (!assets?.length) return;
       const localFiles = await copyAssetsToVault(assets, method);
       const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const drafts = method === "gallery" && localFiles.length > 1
-        ? localFiles.map((file, index) => createDraftDocument(method, [file], index, batchId))
-        : [createDraftDocument(method, localFiles, 0, batchId)];
+        ? localFiles.map((file, index) => createDraftDocument(method, [file], index, batchId, uploadTarget))
+        : [createDraftDocument(method, localFiles, 0, batchId, uploadTarget)];
       setDocs((existing) => [...drafts, ...existing]);
-      go("records");
+      if (uploadTarget?.groupKey) go("recordGroup", { groupKey: uploadTarget.groupKey, mode: uploadTarget.mode || uploadTarget.type });
+      else go("records");
     } catch (error) {
       Alert.alert("Upload failed", error?.message || "Could not import this document.");
     }
   }, [authToken, go]);
-  const reuploadDoc = useCallback(async (docId, method = "gallery") => {
+  const reuploadDoc = useCallback(async (docId, method) => {
+    if (!method) {
+      openReuploadSheet(docId);
+      return;
+    }
     if (!authToken) {
       Alert.alert("Login required", "Please login before reuploading medical documents.");
       go("welcome");
@@ -3129,7 +4203,7 @@ export default function App() {
     } catch (error) {
       Alert.alert("Reupload failed", error?.message || "Could not replace this file.");
     }
-  }, [authToken, docs, go]);
+  }, [authToken, docs, go, openReuploadSheet]);
   const refreshDocuments = useCallback(async () => {
     if (!authToken) return [];
     const remote = await requestDocuments(authToken);
@@ -3164,6 +4238,8 @@ export default function App() {
     setUser(initialUser);
     setDocs([]);
     setFabOpen(false);
+    setReuploadTargetId("");
+    setUploadContext(null);
     setStack([{ screen: "welcome" }]);
   }, [authToken]);
   const nav = { push, pop, go };
@@ -3184,11 +4260,17 @@ export default function App() {
       setDocs((d) => d.filter((doc) => doc.id !== id));
     },
     startUpload,
+    openUploadSheet,
+    openReuploadSheet,
     reuploadDoc,
   };
 
   useEffect(() => {
-    const queued = docs.filter((doc) => doc.status === "queued" && !processingIdsRef.current.has(doc.id));
+    const availableSlots = Math.max(0, PROCESSING_CONCURRENCY - processingIdsRef.current.size);
+    if (!availableSlots) return undefined;
+    const queued = docs
+      .filter((doc) => doc.status === "queued" && !processingIdsRef.current.has(doc.id))
+      .slice(0, availableSlots);
     if (!queued.length) return undefined;
 
     queued.forEach((doc) => {
@@ -3229,9 +4311,23 @@ export default function App() {
   return (
     <SafeAreaView style={styles.app}>
       <StatusBar hidden />
-      <LinearGradient colors={["#FBFCFD", "#F3F5F8"]} style={StyleSheet.absoluteFill} />
+      <LinearGradient colors={["#FAFCFD", "#EEF3F6", "#F8F0F3"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={StyleSheet.absoluteFill} />
       <View style={styles.routeWrap}>{screens[current.screen] || screens.home}</View>
-      {showChrome && isRoot && <BottomNav current={current.screen} nav={nav} fabOpen={fabOpen} setFabOpen={setFabOpen} onUpload={startUpload} />}
+      {showChrome && (
+        <BottomNav
+          current={current.screen}
+          nav={nav}
+          fabOpen={fabOpen}
+          setFabOpen={setFabOpen}
+          reuploadTargetId={reuploadTargetId}
+          setReuploadTargetId={setReuploadTargetId}
+          uploadContext={uploadContext}
+          setUploadContext={setUploadContext}
+          onUpload={startUpload}
+          onReupload={reuploadDoc}
+          showBar={isRoot}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -3259,9 +4355,9 @@ const styles = StyleSheet.create({
     width: "100%",
   },
   header: {
-    paddingHorizontal: 22,
-    paddingTop: 48,
-    paddingBottom: 8,
+    paddingHorizontal: 20,
+    paddingTop: 46,
+    paddingBottom: 10,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -3276,35 +4372,35 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     flexShrink: 1,
-    fontSize: 18,
-    fontWeight: "800",
-    color: C.primary,
+    fontSize: 17,
+    fontWeight: "900",
+    color: C.ink,
   },
   smallIconButton: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 40,
+    height: 40,
+    borderRadius: 12,
   },
   tinyIconButton: {
     width: 34,
     height: 34,
-    borderRadius: 17,
+    borderRadius: 10,
   },
   avatarButton: {
     width: 42,
     height: 42,
-    borderRadius: 18,
+    borderRadius: 12,
     overflow: "hidden",
-    borderWidth: 2,
-    borderColor: "#fff",
+    borderWidth: 1,
+    borderColor: C.line,
     backgroundColor: C.blush,
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: C.primary,
-    shadowOpacity: 0.12,
-    shadowOffset: { width: 0, height: 10 },
-    shadowRadius: 22,
-    elevation: 4,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 16,
+    elevation: 2,
   },
   avatarImage: {
     width: "100%",
@@ -3339,36 +4435,36 @@ const styles = StyleSheet.create({
   iconButton: {
     width: 42,
     height: 42,
-    borderRadius: 21,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: C.line,
-    backgroundColor: "rgba(255,255,255,0.82)",
+    backgroundColor: C.surface,
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: C.primary,
-    shadowOpacity: 0.08,
-    shadowOffset: { width: 0, height: 8 },
-    shadowRadius: 20,
-    elevation: 3,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.05,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 14,
+    elevation: 1,
   },
   iconButtonActive: {
     backgroundColor: C.primary,
     borderColor: C.primary,
   },
   buttonTouch: {
-    borderRadius: 18,
+    borderRadius: 12,
   },
   button: {
     minHeight: 50,
-    borderRadius: 18,
+    borderRadius: 12,
     paddingHorizontal: 18,
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: C.primary,
-    shadowOpacity: 0.24,
-    shadowOffset: { width: 0, height: 12 },
-    shadowRadius: 26,
-    elevation: 4,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.12,
+    shadowOffset: { width: 0, height: 10 },
+    shadowRadius: 18,
+    elevation: 3,
   },
   buttonInner: {
     flexDirection: "row",
@@ -3379,10 +4475,10 @@ const styles = StyleSheet.create({
   buttonText: {
     color: "#fff",
     fontSize: 14,
-    fontWeight: "800",
+    fontWeight: "900",
   },
   softButton: {
-    backgroundColor: C.surface2,
+    backgroundColor: C.surface,
     borderWidth: 1,
     borderColor: C.line,
     shadowOpacity: 0,
@@ -3394,20 +4490,20 @@ const styles = StyleSheet.create({
     elevation: 0,
   },
   card: {
-    backgroundColor: "#FFFFFF",
+    backgroundColor: C.surface,
     borderWidth: 1,
     borderColor: C.line,
-    borderRadius: 16,
-    shadowColor: C.primary,
-    shadowOpacity: 0.05,
-    shadowOffset: { width: 0, height: 8 },
-    shadowRadius: 18,
+    borderRadius: 10,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.045,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 16,
     elevation: 1,
   },
   textButton: {
     color: C.primary,
     fontSize: 13,
-    fontWeight: "800",
+    fontWeight: "900",
   },
   splash: {
     flex: 1,
@@ -3419,21 +4515,21 @@ const styles = StyleSheet.create({
     width: 310,
     height: 310,
     borderRadius: 155,
-    backgroundColor: "rgba(250,141,177,0.26)",
+    backgroundColor: "rgba(122,23,56,0.10)",
   },
   splashMark: {
     width: 118,
     height: 118,
-    borderRadius: 36,
+    borderRadius: 24,
     backgroundColor: "rgba(255,255,255,0.78)",
     borderWidth: 1,
     borderColor: C.line,
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: C.primary,
-    shadowOpacity: 0.18,
-    shadowOffset: { width: 0, height: 30 },
-    shadowRadius: 80,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.10,
+    shadowOffset: { width: 0, height: 24 },
+    shadowRadius: 55,
     elevation: 7,
   },
   splashName: {
@@ -3456,8 +4552,8 @@ const styles = StyleSheet.create({
   },
   welcome: {
     flex: 1,
-    paddingHorizontal: 24,
-    paddingTop: topInset + 74,
+    paddingHorizontal: 20,
+    paddingTop: topInset + 62,
     paddingBottom: 34,
   },
   brandRow: {
@@ -3476,15 +4572,17 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   welcomeCard: {
-    marginTop: 38,
+    marginTop: 34,
     padding: 22,
-    borderRadius: 22,
-    minHeight: 190,
+    borderRadius: 14,
+    minHeight: 184,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.18)",
   },
   welcomeTitle: {
     color: "#fff",
-    fontSize: 28,
-    lineHeight: 32,
+    fontSize: 27,
+    lineHeight: 33,
     fontWeight: "900",
     marginTop: 18,
   },
@@ -3494,8 +4592,28 @@ const styles = StyleSheet.create({
     lineHeight: 21,
     marginTop: 10,
   },
+  welcomeProofGrid: {
+    marginTop: 14,
+    gap: 8,
+  },
+  welcomeProofItem: {
+    minHeight: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.surface,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  welcomeProofText: {
+    color: C.text,
+    fontSize: 12.5,
+    fontWeight: "900",
+  },
   authBody: {
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     paddingTop: 20,
   },
   authTitle: {
@@ -3512,11 +4630,11 @@ const styles = StyleSheet.create({
   phoneRow: {
     flexDirection: "row",
     gap: 10,
-    marginTop: 30,
+    marginTop: 26,
   },
   countryBox: {
     height: 54,
-    borderRadius: 16,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line2,
     backgroundColor: "#fff",
@@ -3537,7 +4655,7 @@ const styles = StyleSheet.create({
   phoneInput: {
     flex: 1,
     height: 54,
-    borderRadius: 16,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line2,
     backgroundColor: "#fff",
@@ -3547,7 +4665,7 @@ const styles = StyleSheet.create({
     color: C.ink,
   },
   bottomAction: {
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     paddingBottom: 30,
   },
   otpRow: {
@@ -3558,7 +4676,7 @@ const styles = StyleSheet.create({
   otpInput: {
     width: 58,
     height: 62,
-    borderRadius: 18,
+    borderRadius: 12,
     borderWidth: 2,
     borderColor: C.line,
     backgroundColor: "#fff",
@@ -3571,7 +4689,7 @@ const styles = StyleSheet.create({
     borderColor: C.primary,
   },
   onboardingCard: {
-    marginHorizontal: 24,
+    marginHorizontal: 20,
     marginTop: 8,
     padding: 18,
   },
@@ -3584,7 +4702,7 @@ const styles = StyleSheet.create({
   profilePreview: {
     width: 62,
     height: 62,
-    borderRadius: 23,
+    borderRadius: 14,
     backgroundColor: C.blush,
     overflow: "hidden",
     alignItems: "center",
@@ -3600,16 +4718,16 @@ const styles = StyleSheet.create({
   },
   fieldLabel: {
     fontSize: 12.5,
-    fontWeight: "800",
+    fontWeight: "900",
     color: C.text,
   },
   fieldBox: {
     marginTop: 7,
     minHeight: 50,
-    borderRadius: 16,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line2,
-    backgroundColor: "rgba(255,255,255,0.9)",
+    backgroundColor: C.surface,
     justifyContent: "center",
   },
   fieldIcon: {
@@ -3648,7 +4766,7 @@ const styles = StyleSheet.create({
     minHeight: 45,
     minWidth: 68,
     flex: 1,
-    borderRadius: 15,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line2,
     backgroundColor: "#fff",
@@ -3668,7 +4786,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   pageBody: {
-    paddingHorizontal: 22,
+    paddingHorizontal: 20,
     paddingTop: 10,
   },
   simplePageHeader: {
@@ -3676,7 +4794,7 @@ const styles = StyleSheet.create({
   },
   simplePageTitle: {
     color: C.ink,
-    fontSize: 24,
+    fontSize: 23,
     lineHeight: 28,
     fontWeight: "900",
   },
@@ -3699,32 +4817,190 @@ const styles = StyleSheet.create({
     marginBottom: 18,
   },
   homeHeroCard: {
-    borderRadius: 22,
-    padding: 20,
-    minHeight: 244,
+    borderRadius: 16,
+    padding: 18,
+    minHeight: 382,
     borderWidth: 1,
-    borderColor: "#FFD4E2",
-    shadowColor: C.primary,
-    shadowOpacity: 0.14,
-    shadowOffset: { width: 0, height: 18 },
+    borderColor: C.line,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.07,
+    shadowOffset: { width: 0, height: 14 },
     shadowRadius: 28,
-    elevation: 5,
+    elevation: 2,
     overflow: "hidden",
   },
-  homeHeroTop: {
+  heroSecurePill: {
+    alignSelf: "flex-start",
+    minHeight: 32,
+    borderRadius: 9,
+    backgroundColor: "rgba(255,255,255,0.82)",
+    borderWidth: 1,
+    borderColor: "rgba(47,143,91,0.14)",
+    paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
+    gap: 7,
   },
-  homeHeroMark: {
-    width: 58,
-    height: 58,
-    borderRadius: 20,
-    backgroundColor: "rgba(255,255,255,0.72)",
-    borderWidth: 1,
-    borderColor: "rgba(116,22,54,0.12)",
+  heroSecureText: {
+    color: C.green,
+    fontSize: 11.5,
+    fontWeight: "900",
+  },
+  vaultHeroVisual: {
+    height: 168,
+    marginTop: 8,
+    marginBottom: 8,
     alignItems: "center",
     justifyContent: "center",
+  },
+  vaultDrawerBack: {
+    position: "absolute",
+    width: 240,
+    height: 118,
+    bottom: 18,
+    borderRadius: 24,
+    backgroundColor: "rgba(122,23,56,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.10)",
+    transform: [{ rotate: "-2deg" }],
+  },
+  vaultFileStack: {
+    width: 214,
+    height: 124,
+    marginTop: 8,
+  },
+  vaultFilePaper: {
+    position: "absolute",
+    left: 18,
+    right: 18,
+    top: 10,
+    height: 100,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.12)",
+    backgroundColor: "#fff",
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.05,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 16,
+    elevation: 1,
+  },
+  vaultFilePaperBack: {
+    transform: [{ rotate: "-7deg" }, { translateX: -12 }, { translateY: 8 }],
+    backgroundColor: "#F3F7F8",
+  },
+  vaultFilePaperMid: {
+    transform: [{ rotate: "6deg" }, { translateX: 13 }, { translateY: 5 }],
+    backgroundColor: "#F9F0F3",
+  },
+  vaultFileFront: {
+    position: "absolute",
+    left: 24,
+    right: 24,
+    top: 0,
+    minHeight: 118,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.14)",
+    backgroundColor: "#FFFFFF",
+    padding: 13,
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowOffset: { width: 0, height: 12 },
+    shadowRadius: 20,
+    elevation: 2,
+  },
+  vaultFileTab: {
+    position: "absolute",
+    top: -1,
+    left: 16,
+    width: 60,
+    height: 13,
+    borderBottomLeftRadius: 7,
+    borderBottomRightRadius: 7,
+    backgroundColor: C.blush,
+  },
+  vaultFileHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    marginTop: 8,
+  },
+  vaultFileMark: {
+    width: 32,
+    height: 32,
+    borderRadius: 9,
+    backgroundColor: C.blush,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  vaultFileLines: {
+    gap: 6,
+  },
+  vaultFileRows: {
+    gap: 9,
+    marginTop: 15,
+  },
+  vaultLineStrong: {
+    height: 8,
+    borderRadius: 99,
+    backgroundColor: C.primary,
+  },
+  vaultLineSoft: {
+    height: 7,
+    borderRadius: 99,
+    backgroundColor: "#DDE7EC",
+  },
+  vaultMiniGrid: {
+    flexDirection: "row",
+    gap: 7,
+    marginTop: 2,
+  },
+  vaultMiniCell: {
+    flex: 1,
+    height: 16,
+    borderRadius: 6,
+    backgroundColor: C.tealSoft,
+  },
+  vaultDrawerBase: {
+    position: "absolute",
+    bottom: 14,
+    width: 246,
+    height: 46,
+    borderRadius: 15,
+    backgroundColor: C.primary,
+    shadowColor: C.primary,
+    shadowOpacity: 0.18,
+    shadowOffset: { width: 0, height: 12 },
+    shadowRadius: 22,
+    elevation: 4,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  vaultDrawerHandle: {
+    width: 76,
+    height: 7,
+    borderRadius: 99,
+    backgroundColor: "rgba(255,255,255,0.55)",
+  },
+  vaultSeal: {
+    position: "absolute",
+    right: 58,
+    bottom: 34,
+    width: 48,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: C.green,
+    borderWidth: 4,
+    borderColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.15,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 16,
+    elevation: 3,
   },
   homeHeroEyebrow: {
     color: C.primary,
@@ -3732,31 +5008,100 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     textTransform: "uppercase",
   },
+  homeHeroGreeting: {
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    marginTop: 2,
+  },
   homeHeroTitle: {
     color: C.ink,
-    fontSize: 25,
-    lineHeight: 30,
+    fontSize: 31,
+    lineHeight: 36,
     fontWeight: "900",
-    marginTop: 4,
+    marginTop: 5,
+    maxWidth: 300,
   },
   homeHeroText: {
     color: C.text,
     fontSize: 13.5,
     lineHeight: 20,
-    marginTop: 15,
-    maxWidth: 300,
+    marginTop: 8,
+    maxWidth: 280,
   },
-  homeHeroStats: {
-    minHeight: 72,
-    borderRadius: 18,
-    backgroundColor: "rgba(255,255,255,0.62)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.78)",
+  homeFilePreview: {
+    minHeight: 92,
     marginTop: 18,
-    paddingHorizontal: 14,
+    justifyContent: "flex-end",
+  },
+  homeFileBack: {
+    position: "absolute",
+    left: 14,
+    right: 14,
+    bottom: 13,
+    height: 62,
+    borderRadius: 10,
+    backgroundColor: "rgba(122,23,56,0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.10)",
+    transform: [{ rotate: "-1.5deg" }],
+  },
+  homeFileSheet: {
+    minHeight: 78,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.16)",
+    backgroundColor: "rgba(255,255,255,0.92)",
+    padding: 13,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
+    gap: 12,
+  },
+  homeFileGrip: {
+    width: 5,
+    alignSelf: "stretch",
+    borderRadius: 999,
+    backgroundColor: C.primary,
+  },
+  homeFileTextBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  homeFileLabel: {
+    color: C.primary,
+    fontSize: 10.5,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  homeFileTitle: {
+    color: C.ink,
+    fontSize: 16,
+    fontWeight: "900",
+    marginTop: 3,
+  },
+  homeFileMeta: {
+    color: C.muted,
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  homeHeroStats: {
+    minHeight: 68,
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  homeHeroStatItem: {
+    flex: 1,
+    minHeight: 66,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.72)",
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.09)",
+    paddingHorizontal: 12,
+    justifyContent: "center",
   },
   homeHeroNumber: {
     color: C.primary,
@@ -3776,7 +5121,7 @@ const styles = StyleSheet.create({
   },
   homeHeroAction: {
     minHeight: 48,
-    borderRadius: 16,
+    borderRadius: 12,
     backgroundColor: C.primary,
     marginTop: 16,
     paddingHorizontal: 16,
@@ -3799,7 +5144,7 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 90,
     padding: 12,
-    borderRadius: 14,
+    borderRadius: 10,
   },
   simpleStatValue: {
     color: C.ink,
@@ -3815,7 +5160,7 @@ const styles = StyleSheet.create({
   },
   primaryUploadCard: {
     minHeight: 84,
-    borderRadius: 16,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
     backgroundColor: "#fff",
@@ -3828,7 +5173,7 @@ const styles = StyleSheet.create({
   primaryUploadIcon: {
     width: 44,
     height: 44,
-    borderRadius: 14,
+    borderRadius: 10,
     backgroundColor: C.primary,
     alignItems: "center",
     justifyContent: "center",
@@ -3846,13 +5191,13 @@ const styles = StyleSheet.create({
   },
   searchBox: {
     height: 52,
-    borderRadius: 14,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line2,
-    backgroundColor: "rgba(255,255,255,0.9)",
+    backgroundColor: C.surface,
     justifyContent: "center",
-    shadowColor: C.primary,
-    shadowOpacity: 0.05,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.04,
     shadowOffset: { width: 0, height: 8 },
     shadowRadius: 20,
     elevation: 2,
@@ -3926,6 +5271,8 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 14,
     minHeight: 96,
+    shadowOpacity: 0,
+    elevation: 0,
   },
   infoLabel: {
     fontSize: 12.5,
@@ -3961,7 +5308,7 @@ const styles = StyleSheet.create({
   categoryIcon: {
     width: 54,
     height: 54,
-    borderRadius: 18,
+    borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -3975,17 +5322,17 @@ const styles = StyleSheet.create({
   },
   docRow: {
     width: "100%",
-    minHeight: 70,
-    borderRadius: 18,
+    minHeight: 68,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
-    backgroundColor: "rgba(255,255,255,0.86)",
+    backgroundColor: C.surface,
     padding: 12,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    shadowColor: C.primary,
-    shadowOpacity: 0.07,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.04,
     shadowOffset: { width: 0, height: 10 },
     shadowRadius: 24,
     elevation: 2,
@@ -3993,7 +5340,7 @@ const styles = StyleSheet.create({
   docIcon: {
     width: 46,
     height: 46,
-    borderRadius: 16,
+    borderRadius: 10,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -4017,7 +5364,7 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   chip: {
-    borderRadius: 999,
+    borderRadius: 10,
     borderWidth: 1,
     paddingVertical: 9,
     paddingHorizontal: 13,
@@ -4076,11 +5423,13 @@ const styles = StyleSheet.create({
     borderRadius: 18,
   },
   recordsModeTabs: {
-    minHeight: 40,
+    minHeight: 42,
     flexDirection: "row",
     gap: 0,
-    marginTop: 8,
-    marginBottom: 2,
+    marginTop: 6,
+    marginBottom: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: C.line,
   },
   drawerModeButton: {
     flex: 1,
@@ -4093,11 +5442,52 @@ const styles = StyleSheet.create({
   },
   drawerModeButtonActive: {
     backgroundColor: "transparent",
+    borderBottomWidth: 2,
+    borderBottomColor: C.primary,
   },
   drawerModeText: {
     color: C.muted,
     fontSize: 12,
     fontWeight: "900",
+  },
+  drawerSummaryBar: {
+    minHeight: 66,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.surface,
+    padding: 12,
+    marginBottom: 18,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 11,
+  },
+  drawerSummaryIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 10,
+    backgroundColor: C.blush,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  drawerSummaryTitle: {
+    color: C.ink,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  drawerSummaryText: {
+    color: C.muted,
+    fontSize: 12.2,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  drawerSummaryAdd: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
   },
   recordsCategoryStrip: {
     gap: 9,
@@ -4111,13 +5501,13 @@ const styles = StyleSheet.create({
   },
   recordsStatsGrid: {
     flexDirection: "row",
-    gap: 10,
-    marginTop: 14,
+    gap: 8,
+    marginTop: 12,
   },
   recordsStatCard: {
     flex: 1,
-    minHeight: 96,
-    borderRadius: 16,
+    minHeight: 86,
+    borderRadius: 10,
     padding: 12,
   },
   recordsStatIcon: {
@@ -4144,30 +5534,39 @@ const styles = StyleSheet.create({
   },
   recordGroupCard: {
     position: "relative",
-    borderRadius: 18,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: "#E8D5DD",
-    backgroundColor: "#FFF9F2",
-    padding: 14,
-    paddingTop: 22,
-    shadowColor: C.primary,
-    shadowOpacity: 0.1,
-    shadowOffset: { width: 0, height: 16 },
-    shadowRadius: 28,
-    elevation: 4,
+    borderColor: "#D9E0EA",
+    backgroundColor: "#FEFCF8",
+    padding: 15,
+    paddingTop: 23,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.075,
+    shadowOffset: { width: 0, height: 14 },
+    shadowRadius: 24,
+    elevation: 2,
+  },
+  fileFolderShadow: {
+    position: "absolute",
+    left: 10,
+    right: 10,
+    bottom: -7,
+    height: 16,
+    borderRadius: 12,
+    backgroundColor: "rgba(15,23,42,0.06)",
   },
   folderTab: {
     position: "absolute",
     top: -10,
-    left: 18,
-    minWidth: 124,
-    height: 26,
-    borderTopLeftRadius: 12,
-    borderTopRightRadius: 12,
+    left: 14,
+    minWidth: 112,
+    height: 25,
+    borderTopLeftRadius: 9,
+    borderTopRightRadius: 9,
     borderWidth: 1,
     borderBottomWidth: 0,
-    borderColor: "#E8D5DD",
-    backgroundColor: "#FFF9F2",
+    borderColor: "#D9E0EA",
+    backgroundColor: "#FEFCF8",
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
@@ -4188,12 +5587,12 @@ const styles = StyleSheet.create({
   recordGroupIcon: {
     width: 48,
     height: 48,
-    borderRadius: 14,
+    borderRadius: 10,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F8E4EC",
+    backgroundColor: "#F4E9ED",
     borderWidth: 1,
-    borderColor: "#EFD1DC",
+    borderColor: "rgba(122,23,56,0.12)",
   },
   recordGroupTitle: {
     color: C.ink,
@@ -4212,12 +5611,14 @@ const styles = StyleSheet.create({
     alignItems: "center",
     flexWrap: "wrap",
     gap: 8,
-    marginTop: 12,
+    marginTop: 14,
   },
   recordGroupMetric: {
     minHeight: 30,
-    borderRadius: 999,
-    backgroundColor: "rgba(116,22,54,0.07)",
+    borderRadius: 9,
+    backgroundColor: "rgba(255,255,255,0.72)",
+    borderWidth: 1,
+    borderColor: "rgba(15,23,42,0.05)",
     paddingHorizontal: 10,
     flexDirection: "row",
     alignItems: "center",
@@ -4236,14 +5637,14 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   drawerFileStack: {
-    marginTop: 10,
-    gap: 8,
+    marginTop: 12,
+    gap: 0,
   },
   drawerFileRow: {
-    minHeight: 60,
-    borderRadius: 13,
+    minHeight: 58,
+    borderRadius: 8,
     borderWidth: 1,
-    borderColor: "#EFE1E5",
+    borderColor: "#E3E0D8",
     backgroundColor: "#FFFFFF",
     padding: 10,
     flexDirection: "row",
@@ -4251,7 +5652,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   drawerFileRowOverlap: {
-    marginTop: -1,
+    marginTop: -6,
+    marginHorizontal: 5,
   },
   drawerFileStripe: {
     width: 4,
@@ -4271,8 +5673,10 @@ const styles = StyleSheet.create({
   },
   drawerMoreRow: {
     minHeight: 42,
-    borderRadius: 12,
-    backgroundColor: C.blush,
+    borderRadius: 9,
+    backgroundColor: "rgba(255,255,255,0.76)",
+    borderWidth: 1,
+    borderColor: "rgba(15,23,42,0.06)",
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
@@ -4284,10 +5688,10 @@ const styles = StyleSheet.create({
     fontWeight: "900",
   },
   recordGroupOpenRow: {
-    minHeight: 38,
-    marginTop: 12,
-    borderRadius: 12,
-    backgroundColor: "rgba(116,22,54,0.07)",
+    minHeight: 42,
+    marginTop: 14,
+    borderRadius: 10,
+    backgroundColor: "rgba(122,23,56,0.09)",
     paddingHorizontal: 12,
     flexDirection: "row",
     alignItems: "center",
@@ -4304,9 +5708,92 @@ const styles = StyleSheet.create({
     gap: 12,
     marginBottom: 14,
   },
+  groupFileCover: {
+    position: "relative",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#D9E0EA",
+    backgroundColor: "#FEFCF8",
+    padding: 14,
+    paddingTop: 24,
+    marginTop: 4,
+    marginBottom: 16,
+  },
+  groupFileTab: {
+    position: "absolute",
+    top: -10,
+    left: 14,
+    minWidth: 124,
+    height: 25,
+    borderTopLeftRadius: 9,
+    borderTopRightRadius: 9,
+    borderWidth: 1,
+    borderBottomWidth: 0,
+    borderColor: "#D9E0EA",
+    backgroundColor: "#FEFCF8",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  groupFileTabText: {
+    color: C.primary,
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  groupFileCoverTop: {
+    minHeight: 58,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  groupFileTitle: {
+    color: C.ink,
+    fontSize: 20,
+    lineHeight: 24,
+    fontWeight: "900",
+  },
+  groupFileSubtitle: {
+    color: C.muted,
+    fontSize: 12.5,
+    fontWeight: "700",
+    marginTop: 4,
+  },
+  groupFileFacts: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 14,
+  },
+  groupFileFact: {
+    flex: 1,
+    minHeight: 38,
+    borderRadius: 9,
+    backgroundColor: "rgba(255,255,255,0.72)",
+    borderWidth: 1,
+    borderColor: "rgba(15,23,42,0.05)",
+    paddingHorizontal: 9,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  groupFileFactText: {
+    flex: 1,
+    color: C.text,
+    fontSize: 11.5,
+    fontWeight: "900",
+  },
   groupOriginalViewer: {
     padding: 14,
-    borderRadius: 16,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.surface,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.055,
+    shadowOffset: { width: 0, height: 10 },
+    shadowRadius: 24,
+    elevation: 2,
   },
   groupViewerTop: {
     flexDirection: "row",
@@ -4319,27 +5806,55 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: "900",
   },
+  groupViewerSubtitle: {
+    color: C.muted,
+    fontSize: 11.8,
+    fontWeight: "700",
+    marginTop: 3,
+  },
   groupViewerCount: {
     color: C.primary,
     fontSize: 12,
     fontWeight: "900",
   },
+  groupAddInlineButton: {
+    minHeight: 46,
+    borderRadius: 12,
+    backgroundColor: C.primary,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  groupAddInlineText: {
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: "900",
+  },
   groupPreviewStage: {
-    height: 370,
-    borderRadius: 14,
-    backgroundColor: C.bg2,
+    height: 410,
+    borderRadius: 12,
+    backgroundColor: "#101820",
     overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+    position: "relative",
+  },
+  groupPreviewPage: {
+    height: 410,
     alignItems: "center",
     justifyContent: "center",
   },
   groupPreviewImage: {
-    width: 320,
-    height: 350,
+    width: 318,
+    height: 390,
   },
   groupPdfPreview: {
     width: 230,
     minHeight: 170,
-    borderRadius: 16,
+    borderRadius: 10,
     backgroundColor: "#fff",
     borderWidth: 1,
     borderColor: C.line,
@@ -4354,9 +5869,187 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginTop: 10,
   },
+  galleryOpenButton: {
+    position: "absolute",
+    right: 12,
+    bottom: 12,
+    minHeight: 34,
+    borderRadius: 9,
+    backgroundColor: "rgba(15,23,42,0.76)",
+    paddingHorizontal: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  galleryOpenText: {
+    color: "#fff",
+    fontSize: 11.5,
+    fontWeight: "900",
+  },
+  groupMissingOriginal: {
+    width: "78%",
+    minHeight: 178,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 18,
+  },
+  groupMissingTitle: {
+    color: "#fff",
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: "900",
+    textAlign: "center",
+    marginTop: 12,
+  },
+  groupMissingText: {
+    color: "rgba(255,255,255,0.68)",
+    fontSize: 12.2,
+    lineHeight: 17,
+    fontWeight: "700",
+    textAlign: "center",
+    marginTop: 7,
+  },
+  timelinePanel: {
+    marginTop: 14,
+    borderRadius: 14,
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 14,
+    paddingTop: 13,
+    paddingBottom: 12,
+    shadowColor: "#321020",
+    shadowOpacity: 0.06,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 18,
+    elevation: 2,
+  },
+  timelineHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 10,
+  },
+  timelineLabel: {
+    color: C.primary,
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  timelineDate: {
+    color: C.ink,
+    fontSize: 17,
+    fontWeight: "900",
+    marginTop: 2,
+  },
+  timelinePosition: {
+    color: C.primary,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  timelineCountPill: {
+    borderRadius: 999,
+    backgroundColor: C.blush,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  timelineControlRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  timelineStepButton: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: "#FFF7FA",
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  timelineStepDisabled: {
+    backgroundColor: "#F4F6F8",
+    borderColor: "#E6ECF1",
+  },
+  timelineRailTouch: {
+    flex: 1,
+    height: 54,
+    justifyContent: "center",
+    position: "relative",
+  },
+  timelineRailOuter: {
+    height: 34,
+    justifyContent: "center",
+    position: "relative",
+  },
+  timelineRail: {
+    height: 15,
+    borderRadius: 999,
+    backgroundColor: "#EEF2F6",
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.08)",
+  },
+  timelineRailFill: {
+    position: "absolute",
+    left: 0,
+    top: 9.5,
+    height: 15,
+    borderRadius: 999,
+    backgroundColor: "#D7869F",
+  },
+  timelineThumb: {
+    position: "absolute",
+    top: 0,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#fff",
+    borderWidth: 4,
+    borderColor: C.primary2,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.2,
+    shadowOffset: { width: 0, height: 7 },
+    shadowRadius: 12,
+    elevation: 5,
+  },
+  timelineThumbActive: {
+    borderColor: C.primary,
+    shadowOpacity: 0.28,
+  },
+  timelineThumbDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: C.primary,
+  },
+  timelineFooter: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  timelineRangeText: {
+    flex: 1,
+    color: C.muted,
+    fontSize: 11.4,
+    fontWeight: "800",
+  },
+  timelineCurrentText: {
+    flex: 1,
+    color: C.primary,
+    fontSize: 11.8,
+    fontWeight: "900",
+    textAlign: "center",
+  },
   groupSelectedMeta: {
     minHeight: 58,
-    borderRadius: 14,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
     backgroundColor: "#fff",
@@ -4365,6 +6058,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+    overflow: "hidden",
   },
   groupSelectedTitle: {
     color: C.ink,
@@ -4385,11 +6079,38 @@ const styles = StyleSheet.create({
   groupThumb: {
     width: 58,
     height: 70,
-    borderRadius: 12,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: C.line,
     backgroundColor: C.bg2,
     overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  groupThumbNumber: {
+    position: "absolute",
+    left: 4,
+    bottom: 4,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 5,
+    backgroundColor: "rgba(15,23,42,0.78)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  groupThumbNumberText: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+  groupThumbIssue: {
+    position: "absolute",
+    right: 4,
+    top: 4,
+    width: 18,
+    height: 18,
+    borderRadius: 6,
+    backgroundColor: C.amber,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -4401,20 +6122,166 @@ const styles = StyleSheet.create({
     width: "100%",
     height: "100%",
   },
-  enterpriseRecordCard: {
-    borderRadius: 18,
+  lastVisitCard: {
+    padding: 15,
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  lastVisitIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 10,
+    backgroundColor: C.blush,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  lastVisitLabel: {
+    color: C.muted,
+    fontSize: 12.5,
+    fontWeight: "800",
+  },
+  lastVisitValue: {
+    color: C.ink,
+    fontSize: 20,
+    fontWeight: "900",
+    marginTop: 2,
+  },
+  recordProcessCard: {
+    padding: 14,
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+  },
+  recordProcessCardWarn: {
+    backgroundColor: C.amberSoft,
+    borderColor: "rgba(166,95,22,0.18)",
+  },
+  recordProcessCardInfo: {
+    backgroundColor: C.blueSoft,
+    borderColor: "rgba(40,103,178,0.16)",
+  },
+  recordProcessIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.78)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  recordProcessTitle: {
+    color: C.ink,
+    fontSize: 14.5,
+    lineHeight: 19,
+    fontWeight: "900",
+  },
+  recordProcessText: {
+    color: C.text,
+    fontSize: 12.4,
+    lineHeight: 17,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  recordSummaryPanel: {
+    padding: 16,
+    marginTop: 14,
+  },
+  sectionHeaderSpread: {
+    minHeight: 34,
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 4,
+  },
+  sectionActions: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  sectionActionButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
-    backgroundColor: "rgba(255,255,255,0.92)",
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  sectionActionButtonDisabled: {
+    opacity: 0.45,
+  },
+  recordSummaryGrid: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  recordSummaryTile: {
+    flex: 1,
+    minHeight: 82,
+    borderRadius: 11,
+    backgroundColor: "#F9F3F5",
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.08)",
+    padding: 11,
+    justifyContent: "space-between",
+  },
+  recordSummaryLabel: {
+    color: C.muted,
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    marginTop: 8,
+  },
+  recordSummaryValue: {
+    color: C.ink,
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  groupAiPanel: {
+    backgroundColor: C.greenSoft,
+    borderColor: "rgba(47,143,91,0.14)",
+  },
+  sectionLoadingRow: {
+    minHeight: 52,
+    borderRadius: 11,
+    backgroundColor: "rgba(255,255,255,0.68)",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  sectionMutedText: {
+    flex: 1,
+    color: C.text,
+    fontSize: 12.8,
+    lineHeight: 18,
+    fontWeight: "700",
+  },
+  sectionFootnote: {
+    color: C.green,
+    fontSize: 11.8,
+    lineHeight: 16,
+    fontWeight: "800",
+    marginTop: 10,
+  },
+  enterpriseRecordCard: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.surface,
     padding: 14,
-    shadowColor: C.primary,
-    shadowOpacity: 0.08,
-    shadowOffset: { width: 0, height: 12 },
-    shadowRadius: 26,
-    elevation: 3,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.045,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 18,
+    elevation: 1,
   },
   enterpriseRecordCardCompact: {
-    borderRadius: 14,
+    borderRadius: 10,
     padding: 11,
     backgroundColor: C.bg2,
     shadowOpacity: 0,
@@ -4428,7 +6295,7 @@ const styles = StyleSheet.create({
   recordCategoryIcon: {
     width: 44,
     height: 44,
-    borderRadius: 14,
+    borderRadius: 10,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -4445,7 +6312,7 @@ const styles = StyleSheet.create({
   },
   statusPill: {
     minHeight: 28,
-    borderRadius: 999,
+    borderRadius: 8,
     paddingHorizontal: 9,
     flexDirection: "row",
     alignItems: "center",
@@ -4474,7 +6341,7 @@ const styles = StyleSheet.create({
   recordMetaItem: {
     flex: 1,
     minWidth: 0,
-    borderRadius: 12,
+    borderRadius: 8,
     backgroundColor: C.bg2,
     paddingHorizontal: 10,
     paddingVertical: 9,
@@ -4504,7 +6371,7 @@ const styles = StyleSheet.create({
   },
   recordTag: {
     overflow: "hidden",
-    borderRadius: 999,
+    borderRadius: 7,
     backgroundColor: C.blush,
     color: C.primary,
     fontSize: 10.5,
@@ -4862,7 +6729,7 @@ const styles = StyleSheet.create({
   emptyIcon: {
     width: 66,
     height: 66,
-    borderRadius: 22,
+    borderRadius: 14,
     backgroundColor: C.surface2,
     alignItems: "center",
     justifyContent: "center",
@@ -4882,10 +6749,19 @@ const styles = StyleSheet.create({
   },
   previewCard: {
     minHeight: 354,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.line,
     alignItems: "center",
     justifyContent: "center",
     padding: 22,
     backgroundColor: C.surface,
+    overflow: "hidden",
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.055,
+    shadowOffset: { width: 0, height: 10 },
+    shadowRadius: 24,
+    elevation: 2,
   },
   pdfGrid: {
     flexDirection: "row",
@@ -4909,10 +6785,10 @@ const styles = StyleSheet.create({
   toolButton: {
     flex: 1,
     minHeight: 62,
-    borderRadius: 17,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: C.line,
-    backgroundColor: "rgba(255,255,255,0.86)",
+    backgroundColor: C.surface,
     alignItems: "center",
     justifyContent: "center",
     gap: 5,
@@ -4932,6 +6808,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+    backgroundColor: C.surface,
+    shadowOpacity: 0,
+    elevation: 0,
   },
   readyTitle: {
     fontSize: 14,
@@ -4949,11 +6828,13 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 11,
+    shadowOpacity: 0,
+    elevation: 0,
   },
   uploadStatusIcon: {
     width: 42,
     height: 42,
-    borderRadius: 14,
+    borderRadius: 10,
     backgroundColor: C.greenSoft,
     alignItems: "center",
     justifyContent: "center",
@@ -4971,12 +6852,12 @@ const styles = StyleSheet.create({
   originalImagePreview: {
     width: "100%",
     height: "100%",
-    borderRadius: 16,
+    borderRadius: 10,
   },
   pdfPreviewPanel: {
     width: "100%",
     minHeight: 240,
-    borderRadius: 18,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
     backgroundColor: C.bg2,
@@ -4997,6 +6878,84 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 18,
     marginTop: 7,
+  },
+  pdfPreviewShell: {
+    width: DEVICE_WIDTH - 82,
+    height: 340,
+    borderRadius: 10,
+    backgroundColor: "#fff",
+    overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pdfPreviewShellFull: {
+    width: DEVICE_WIDTH,
+    height: DEVICE_HEIGHT - 172,
+    borderRadius: 0,
+    backgroundColor: "transparent",
+  },
+  pdfNativePreview: {
+    width: DEVICE_WIDTH - 82,
+    height: 340,
+    backgroundColor: "#fff",
+  },
+  pdfCompactPreview: {
+    width: DEVICE_WIDTH - 74,
+    height: 286,
+    backgroundColor: "#fff",
+  },
+  pdfFullPreview: {
+    width: DEVICE_WIDTH,
+    height: DEVICE_HEIGHT - 172,
+    backgroundColor: "#fff",
+  },
+  pdfPageBadge: {
+    position: "absolute",
+    right: 10,
+    bottom: 10,
+    minHeight: 26,
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    backgroundColor: "rgba(15,23,42,0.76)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pdfPageBadgeText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "900",
+  },
+  pdfRenderFallback: {
+    width: DEVICE_WIDTH - 82,
+    minHeight: 240,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.bg2,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+  },
+  pdfRenderFallbackFull: {
+    width: DEVICE_WIDTH - 42,
+    minHeight: DEVICE_HEIGHT - 230,
+    borderColor: "rgba(255,255,255,0.14)",
+    backgroundColor: "#fff",
+  },
+  pdfFallbackTitle: {
+    color: C.ink,
+    fontSize: 16,
+    fontWeight: "900",
+    textAlign: "center",
+    marginTop: 12,
+  },
+  pdfFallbackText: {
+    color: C.muted,
+    fontSize: 12.5,
+    lineHeight: 18,
+    textAlign: "center",
+    marginTop: 7,
+    fontWeight: "700",
   },
   documentMock: {
     borderRadius: 12,
@@ -5070,8 +7029,8 @@ const styles = StyleSheet.create({
   },
   analysisHeroCard: {
     padding: 16,
-    backgroundColor: "#FFF7F9",
-    borderRadius: 18,
+    backgroundColor: C.surface,
+    borderRadius: 14,
   },
   analysisHeroTop: {
     flexDirection: "row",
@@ -5081,19 +7040,36 @@ const styles = StyleSheet.create({
   analysisCrossWrap: {
     width: 64,
     height: 64,
-    borderRadius: 20,
+    borderRadius: 16,
     backgroundColor: "#fff",
     borderWidth: 1,
     borderColor: C.line,
     alignItems: "center",
     justifyContent: "center",
   },
+  analysisSavedRow: {
+    minHeight: 36,
+    borderRadius: 9,
+    backgroundColor: C.greenSoft,
+    paddingHorizontal: 10,
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+  },
+  analysisSavedText: {
+    flex: 1,
+    color: C.green,
+    fontSize: 11.8,
+    lineHeight: 16,
+    fontWeight: "800",
+  },
   extractorPanel: {
     minHeight: 156,
-    borderRadius: 16,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: C.line,
-    backgroundColor: "rgba(255,255,255,0.82)",
+    backgroundColor: C.surface2,
     marginTop: 16,
     padding: 14,
     flexDirection: "row",
@@ -5103,7 +7079,7 @@ const styles = StyleSheet.create({
   extractorDocument: {
     width: 118,
     height: 128,
-    borderRadius: 14,
+    borderRadius: 10,
     backgroundColor: "#fff",
     borderWidth: 1,
     borderColor: C.line2,
@@ -5161,8 +7137,8 @@ const styles = StyleSheet.create({
   },
   packetRow: {
     minHeight: 34,
-    borderRadius: 12,
-    backgroundColor: C.bg2,
+    borderRadius: 8,
+    backgroundColor: C.surface,
     borderWidth: 1,
     borderColor: C.line,
     paddingHorizontal: 10,
@@ -5215,14 +7191,14 @@ const styles = StyleSheet.create({
   progressTrack: {
     width: "100%",
     height: 5,
-    borderRadius: 999,
+    borderRadius: 4,
     backgroundColor: "rgba(116,22,54,0.18)",
     marginTop: 18,
     overflow: "hidden",
   },
   progressFill: {
     height: "100%",
-    borderRadius: 999,
+    borderRadius: 4,
     backgroundColor: C.primary,
   },
   analysisSteps: {
@@ -5267,7 +7243,8 @@ const styles = StyleSheet.create({
   originalCard: {
     marginTop: 18,
     padding: 16,
-    backgroundColor: C.cream,
+    backgroundColor: C.surface,
+    borderRadius: 14,
   },
   originalHeader: {
     flexDirection: "row",
@@ -5286,8 +7263,8 @@ const styles = StyleSheet.create({
   },
   originalPreview: {
     height: 296,
-    borderRadius: 18,
-    backgroundColor: "#F7EFEA",
+    borderRadius: 12,
+    backgroundColor: "#101820",
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
@@ -5325,9 +7302,43 @@ const styles = StyleSheet.create({
     color: C.text,
     fontWeight: "700",
   },
+  documentViewerShell: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: C.surface,
+    padding: 12,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.055,
+    shadowOffset: { width: 0, height: 10 },
+    shadowRadius: 24,
+    elevation: 2,
+  },
+  documentViewerTop: {
+    minHeight: 46,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 10,
+  },
+  documentViewerLabel: {
+    color: C.primary,
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  documentViewerName: {
+    maxWidth: 220,
+    color: C.ink,
+    fontSize: 13.5,
+    fontWeight: "900",
+    marginTop: 3,
+  },
   documentViewer: {
     height: 390,
-    backgroundColor: C.cream,
+    borderRadius: 12,
+    backgroundColor: "#101820",
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
@@ -5335,7 +7346,7 @@ const styles = StyleSheet.create({
   viewerImagePreview: {
     width: 270,
     height: 350,
-    borderRadius: 16,
+    borderRadius: 10,
   },
   viewerTools: {
     flexDirection: "row",
@@ -5345,7 +7356,7 @@ const styles = StyleSheet.create({
   viewerTool: {
     flex: 1,
     height: 45,
-    borderRadius: 15,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
     backgroundColor: "#fff",
@@ -5466,11 +7477,20 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     marginTop: 2,
   },
+  reportHeadingLarge: {
+    fontSize: 16,
+    lineHeight: 22,
+  },
   reportText: {
     color: C.text,
     fontSize: 13,
     lineHeight: 19,
     fontWeight: "600",
+  },
+  reportTextLarge: {
+    fontSize: 13.8,
+    lineHeight: 20.5,
+    fontWeight: "700",
   },
   reportBulletRow: {
     flexDirection: "row",
@@ -5490,7 +7510,7 @@ const styles = StyleSheet.create({
   reportTable: {
     borderWidth: 1,
     borderColor: C.line2,
-    borderRadius: 10,
+    borderRadius: 8,
     overflow: "hidden",
     minWidth: 290,
   },
@@ -5520,6 +7540,24 @@ const styles = StyleSheet.create({
     color: C.ink,
     fontWeight: "900",
   },
+  readMoreButton: {
+    minHeight: 42,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: "rgba(122,23,56,0.12)",
+    backgroundColor: "#FFF8FA",
+    paddingHorizontal: 13,
+    marginTop: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+  },
+  readMoreText: {
+    color: C.primary,
+    fontSize: 12.5,
+    fontWeight: "900",
+  },
   twoCol: {
     flexDirection: "row",
     gap: 10,
@@ -5534,7 +7572,7 @@ const styles = StyleSheet.create({
   fullPreviewImage: {
     width: "92%",
     height: "78%",
-    borderRadius: 18,
+    borderRadius: 10,
   },
   fullClose: {
     position: "absolute",
@@ -5542,10 +7580,68 @@ const styles = StyleSheet.create({
     right: 24,
     width: 42,
     height: 42,
-    borderRadius: 21,
+    borderRadius: 12,
     backgroundColor: "#fff",
     alignItems: "center",
     justifyContent: "center",
+  },
+  galleryModal: {
+    flex: 1,
+    backgroundColor: "#050A10",
+    paddingTop: topInset + 28,
+    paddingBottom: 26,
+  },
+  galleryModalTop: {
+    minHeight: 54,
+    paddingHorizontal: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  galleryTopButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  galleryCounter: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  galleryModalPage: {
+    minHeight: DEVICE_HEIGHT - 170,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  galleryModalImage: {
+    width: DEVICE_WIDTH,
+    height: DEVICE_HEIGHT - 190,
+  },
+  galleryPdfPreview: {
+    width: DEVICE_WIDTH - 72,
+    minHeight: 260,
+    borderRadius: 14,
+    backgroundColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 20,
+  },
+  galleryPdfTitle: {
+    color: C.ink,
+    fontSize: 16,
+    fontWeight: "900",
+    marginTop: 12,
+  },
+  galleryModalTools: {
+    minHeight: 58,
+    paddingHorizontal: 18,
+    flexDirection: "row",
+    gap: 10,
   },
   profileCard: {
     padding: 18,
@@ -5554,7 +7650,7 @@ const styles = StyleSheet.create({
   profilePhoto: {
     width: 88,
     height: 88,
-    borderRadius: 30,
+    borderRadius: 18,
     overflow: "hidden",
     backgroundColor: C.blush,
     alignItems: "center",
@@ -5575,6 +7671,10 @@ const styles = StyleSheet.create({
     padding: 16,
     marginTop: 15,
   },
+  formPanel: {
+    padding: 16,
+    marginTop: 14,
+  },
   toggleRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -5584,7 +7684,7 @@ const styles = StyleSheet.create({
   toggleIcon: {
     width: 38,
     height: 38,
-    borderRadius: 14,
+    borderRadius: 10,
     backgroundColor: C.blush,
     alignItems: "center",
     justifyContent: "center",
@@ -5610,23 +7710,23 @@ const styles = StyleSheet.create({
   },
   sheetScrim: {
     flex: 1,
-    backgroundColor: "rgba(48,38,42,0.38)",
+    backgroundColor: "rgba(15,23,42,0.42)",
     justifyContent: "flex-end",
   },
   uploadSheet: {
-    marginHorizontal: 14,
-    marginBottom: 18,
-    borderRadius: 24,
-    backgroundColor: "rgba(255,250,249,0.98)",
+    marginHorizontal: 12,
+    marginBottom: 14,
+    borderRadius: 14,
+    backgroundColor: C.surface,
     borderWidth: 1,
     borderColor: C.line,
     paddingHorizontal: 18,
     paddingTop: 12,
     paddingBottom: 18,
-    shadowColor: "#22121B",
-    shadowOpacity: 0.24,
-    shadowOffset: { width: 0, height: 24 },
-    shadowRadius: 60,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.22,
+    shadowOffset: { width: 0, height: 18 },
+    shadowRadius: 42,
     elevation: 8,
   },
   sheetGrabber: {
@@ -5649,12 +7749,12 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   sheetOptions: {
-    gap: 12,
-    marginTop: 22,
+    gap: 10,
+    marginTop: 20,
   },
   uploadOption: {
-    minHeight: 82,
-    borderRadius: 14,
+    minHeight: 76,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: C.line,
     backgroundColor: C.bg2,
@@ -5666,7 +7766,7 @@ const styles = StyleSheet.create({
   uploadOptionIcon: {
     width: 46,
     height: 46,
-    borderRadius: 13,
+    borderRadius: 10,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -5682,19 +7782,19 @@ const styles = StyleSheet.create({
   },
   bottomNav: {
     position: "absolute",
-    left: 24,
-    right: 24,
-    bottom: 16,
-    height: 68,
-    borderRadius: 24,
-    backgroundColor: "rgba(255,255,255,0.95)",
+    left: 18,
+    right: 18,
+    bottom: 14,
+    height: 66,
+    borderRadius: 16,
+    backgroundColor: C.surface,
     borderWidth: 1,
     borderColor: C.line,
-    shadowColor: C.primary,
-    shadowOpacity: 0.16,
-    shadowOffset: { width: 0, height: 16 },
-    shadowRadius: 40,
-    elevation: 7,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.14,
+    shadowOffset: { width: 0, height: 12 },
+    shadowRadius: 28,
+    elevation: 5,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-around",
@@ -5713,24 +7813,24 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   navActivePill: {
-    backgroundColor: C.blushStrong,
+    backgroundColor: C.blush,
     paddingHorizontal: 10,
     paddingVertical: 5,
-    borderRadius: 999,
+    borderRadius: 8,
     marginTop: -1,
   },
   navFab: {
-    width: 66,
-    height: 66,
-    borderRadius: 33,
+    width: 64,
+    height: 64,
+    borderRadius: 18,
     backgroundColor: C.primary,
     alignItems: "center",
     justifyContent: "center",
     marginTop: -28,
     shadowColor: C.primary,
-    shadowOpacity: 0.35,
-    shadowOffset: { width: 0, height: 16 },
-    shadowRadius: 30,
+    shadowOpacity: 0.24,
+    shadowOffset: { width: 0, height: 12 },
+    shadowRadius: 24,
     elevation: 8,
   },
 });
