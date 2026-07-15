@@ -42,6 +42,17 @@ function azureContainerName() {
   ).trim();
 }
 
+function localStorageRoot() {
+  return path.resolve(__dirname, "..", "..", "storage");
+}
+
+function storageProviderPreference() {
+  const provider = String(process.env.STORAGE_PROVIDER || "").trim().toLowerCase();
+  if (["azure", "azure_blob", "blob"].includes(provider)) return "azure_blob";
+  if (provider === "local") return "local";
+  return "auto";
+}
+
 function azureBlobServiceClient() {
   const connectionString = (
     process.env.AZURE_STORAGE_CONNECTION_STRING
@@ -70,7 +81,7 @@ function azureBlobServiceClient() {
   return new BlobServiceClient(`https://${accountName}.blob.core.windows.net`, credential);
 }
 
-function isAzureBlobConfigured() {
+export function isAzureBlobConfigured() {
   return Boolean(
     process.env.AZURE_STORAGE_CONNECTION_STRING
     || process.env.AZURE_BLOB_CONNECTION_STRING
@@ -79,6 +90,15 @@ function isAzureBlobConfigured() {
       && (process.env.AZURE_STORAGE_ACCOUNT_KEY || process.env.AZURE_BLOB_ACCOUNT_KEY)
     )
   );
+}
+
+export function storageStatus() {
+  return {
+    provider: storageProviderPreference(),
+    azureBlobConfigured: isAzureBlobConfigured(),
+    azureContainer: azureContainerName(),
+    localStorageRoot: localStorageRoot(),
+  };
 }
 
 async function saveOriginalFileLocally({
@@ -99,10 +119,10 @@ async function saveOriginalFileLocally({
   const mm = String(now.getMonth() + 1).padStart(2, "0");
   const id = safeSegment(documentId || crypto.randomUUID());
   const name = safeSegment(fileName || "medical-document");
-  const baseDir = path.resolve(process.cwd(), "storage", "originals", yyyy, mm);
+  const baseDir = path.resolve(localStorageRoot(), "originals", yyyy, mm);
   await fs.mkdir(baseDir, { recursive: true });
   const storageKey = path.join("originals", yyyy, mm, `${id}-${name}`);
-  const targetPath = path.resolve(process.cwd(), "storage", storageKey);
+  const targetPath = path.resolve(localStorageRoot(), storageKey);
   await fs.copyFile(sourcePath, targetPath);
   const stat = await fs.stat(targetPath);
 
@@ -171,7 +191,15 @@ export async function saveOriginalFile({
   mimeType: string;
   documentId?: string;
 }): Promise<StoredOriginal> {
+  const provider = storageProviderPreference();
+  if (provider === "local") {
+    return saveOriginalFileLocally({ sourcePath, fileName, mimeType, documentId });
+  }
+
   if (!isAzureBlobConfigured()) {
+    if (provider === "azure_blob") {
+      throw new Error("Azure Blob Storage is selected but not configured.");
+    }
     return saveOriginalFileLocally({ sourcePath, fileName, mimeType, documentId });
   }
 
@@ -184,6 +212,9 @@ export async function saveOriginalFile({
       error: message,
       at: new Date().toISOString(),
     }));
+    if (provider === "azure_blob") {
+      throw new Error(`Azure Blob upload failed: ${message}`);
+    }
     return saveOriginalFileLocally({
       sourcePath,
       fileName,
@@ -214,7 +245,7 @@ export async function readStoredOriginal(original: StoredOriginal): Promise<Stor
     };
   }
 
-  const storageRoot = path.resolve(process.cwd(), "storage");
+  const storageRoot = localStorageRoot();
   const targetPath = path.resolve(storageRoot, original.storageKey);
   if (!targetPath.startsWith(storageRoot)) {
     throw new Error("Invalid local storage path.");

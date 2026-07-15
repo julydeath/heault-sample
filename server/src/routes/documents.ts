@@ -16,7 +16,7 @@ import {
   AzureDocumentIntelligenceConfigurationError,
   isAzureDocumentIntelligenceConfigured,
 } from "../services/azureDocumentIntelligenceClient";
-import { readStoredOriginal, saveOriginalFile, StoredOriginal } from "../services/storage";
+import { readStoredOriginal, saveOriginalFile, storageStatus, StoredOriginal } from "../services/storage";
 import { validateOcrForUpload } from "../services/documentValidation";
 import { getCollection } from "../services/database";
 import { AuthenticatedRequest, requireAuth } from "./auth";
@@ -1543,6 +1543,15 @@ router.get("/documents", requireAuth, async (req: AuthenticatedRequest, res) => 
     .limit(500)
     .toArray();
   res.json({ documents: records.map((record) => appDocumentFromRecord(record as Record<string, unknown>)) });
+});
+
+router.get("/storage/status", requireAuth, (_req: AuthenticatedRequest, res) => {
+  const status = storageStatus();
+  res.json({
+    provider: status.provider,
+    azureBlobConfigured: status.azureBlobConfigured,
+    azureContainer: status.azureContainer,
+  });
 });
 
 router.get("/documents/:documentId/originals/:index", requireAuth, async (req: AuthenticatedRequest, res) => {
